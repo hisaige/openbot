@@ -19,7 +19,7 @@
 
 import { Database } from "bun:sqlite"
 import type { Bot, ConversationId } from "@openbot/contracts"
-import { mkdirSync } from "node:fs"
+import { mkdirSync, rmSync } from "node:fs"
 import { join } from "node:path"
 import { connectRpc, hasChromium, launchBrowser, openApp, type AppPage, type Brain, type Rpc } from "./brain.ts"
 import { buildFixtureEntries, type FixtureStats, FIXTURE_INTERVAL_MS, measureFixture, touchConversation, writeFixtureEntries } from "../fixtures/long-conversation.ts"
@@ -113,7 +113,9 @@ export const startFixtureBrain = async (options?: FixtureBrainOptions): Promise<
         stop,
         dispose: async () => {
           await stop()
-          await Bun.$`rm -rf ${dataDir}`.quiet().nothrow()
+          // `rmSync`, not a shell: `brain.ts:100` does the same. A shell call would depend on the
+          // shell's quoting rules for the interpolated path; `rmSync` does not.
+          rmSync(dataDir, { recursive: true, force: true })
         },
       }
     }

@@ -18,6 +18,7 @@ import {
   disableMarkdownParseStats,
   enableMarkdownParseStats,
   markdownParseStats,
+  markdownParseStatsBodyCount,
   Markdown,
   MentionText,
   renderInline,
@@ -110,6 +111,51 @@ test("counter: reset clears the counters but keeps the per-body memory (C-10)", 
   expect(stats.parses).toBe(1)
   expect(stats.unchangedBodies).toBe(1)
   expect(stats.changedBodies).toBe(0)
+  resetMarkdownParseStats()
+  disableMarkdownParseStats()
+})
+
+test("counter: the per-body text memory is BOUNDED (it holds a copy of every message)", () => {
+  // The memory holds a FULL COPY of each body's text. Unbounded, it would grow with the
+  // conversation and keep every message resident for the life of the tab. So there is a limit,
+  // and the oldest bodies are dropped first.
+  enableMarkdownParseStats()
+  resetMarkdownParseStats()
+  const before = markdownParseStatsBodyCount()
+  // Well past the limit (500 bodies).
+  for (let i = 0; i < 620; i++) {
+    markup(createElement(Markdown, { text: `body ${i}`, bodyId: `ent_bound_${i}` }))
+  }
+  const after = markdownParseStatsBodyCount()
+  expect(after).toBeLessThanOrEqual(500)
+  expect(after).toBeGreaterThan(before)
+  // The OLDEST bodies are the ones dropped: the most recent one is still remembered (its text
+  // is still there), so a re-parse of it counts as "unchanged" rather than "first".
+  markup(createElement(Markdown, { text: "body 619", bodyId: "ent_bound_619" }))
+  expect(markdownParseStats().unchangedBodies).toBe(1)
+  // And an EVICTED one is forgotten: re-parsing it is a "first parse" again, not "unchanged".
+  resetMarkdownParseStats()
+  markup(createElement(Markdown, { text: "body 0", bodyId: "ent_bound_0" }))
+  expect(markdownParseStats().unchangedBodies).toBe(0)
+  expect(markdownParseStats().changedBodies).toBe(0)
+  resetMarkdownParseStats()
+  disableMarkdownParseStats()
+})
+
+test("counter: a body that streams stays resident while it is being re-parsed", () => {
+  // The eviction must not drop the body that is currently streaming: it is re-parsed on every
+  // chunk, and if it were evicted mid-turn its next parse would look like a "first parse" and
+  // the "changed" count would be wrong.
+  enableMarkdownParseStats()
+  resetMarkdownParseStats()
+  for (let i = 0; i < 620; i++) {
+    markup(createElement(Markdown, { text: `filler ${i}`, bodyId: `ent_stream_${i}` }))
+  }
+  markup(createElement(Markdown, { text: "chunk 1", bodyId: "ent_stream_live" }))
+  markup(createElement(Markdown, { text: "chunk 2", bodyId: "ent_stream_live" }))
+  const stats = markdownParseStats()
+  expect(stats.changedBodies).toBe(1)
+  expect(stats.unchangedBodies).toBe(0)
   resetMarkdownParseStats()
   disableMarkdownParseStats()
 })

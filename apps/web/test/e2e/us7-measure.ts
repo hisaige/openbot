@@ -49,26 +49,73 @@ export interface Us7Measurement {
   readonly turnMs: number
   /** The time from the turn's start to the terminal state's arrival, in ms (US-7's fourth criterion). */
   readonly terminalMs: number
-  /** From the first intermediate state to the terminal (the whole stream span). */
+  /**
+   * The whole stream span: from the FIRST INTERMEDIATE state to the terminal state.
+   *
+   * NOT from the first item the client saw: the bot's first upsert already carries
+   * `streaming: true`, so the first item IS the first intermediate state — but the two are read
+   * from different filters, and saying which one the number uses removes the ambiguity.
+   */
   readonly streamSpanMs: number
-  /** E-7 (observation, not a criterion): the delay until the first intermediate state arrives. */
+  /**
+   * E-7 (observation, not a criterion): the delay until the first intermediate state is visible to
+   * the client, measured from the arm mark.
+   *
+   * See {@link firstVisibleDelayMs} for why the reference point is the arm mark and not the first
+   * item.
+   */
   readonly firstVisibleMs: number
+  /** The arm mark the delay was measured from (the page clock, `performance.now()`). */
+  readonly armedAt: number | null
   /** How many words the turn streamed (N). */
   readonly words: number
+  /** Whether the harness streamed with its SLOW chunk delay (the E-7 falsification arm). */
+  readonly slow: boolean
+}
+
+/**
+ * E-7: the delay until the client saw the FIRST intermediate state of the streaming entry.
+ *
+ * THE REFERENCE POINT IS THE ARM MARK, NOT THE FIRST ITEM. The bot's FIRST upsert already carries
+ * `streaming: true` — the fake harness's `streamMessage` upserts `{ streaming: true }` for EVERY
+ * chunk, the first one included (`packages/harness-fake/src/Session.ts`), and `TurnIngest`'s
+ * `itemFields` copies `streaming` straight off the harness item. So "the first intermediate state"
+ * and "the first bot item" are THE SAME OBJECT, and a formula that subtracts one from the other
+ * is `x - x = 0`: it cannot tell a 0 ms delay from a 10 s one. (That was the first version's bug,
+ * and it made the handoff claim the window never held the first state back — which is exactly what
+ * the window does.)
+ *
+ * The arm mark is taken in the PAGE, on `performance.now()` — the same clock every item's `at` is
+ * on. The harness's `Date.now()` is a different time base and cannot be subtracted from it.
+ *
+ * Returns -1 when there is nothing to measure (never armed, or no intermediate state arrived).
+ */
+export const firstVisibleDelayMs = (armedAt: number | null, firstIntermediateAt: number | undefined): number => {
+  if (armedAt === null) return -1
+  if (firstIntermediateAt === undefined) return -1
+  return Math.round(firstIntermediateAt - armedAt)
 }
 
 /**
  * Measures one streaming turn under the given window setting.
  *
  * `maxPending: 1` is the unmerged control — the window degenerates to "publish every change".
+ *
+ * `slow: true` makes the fake harness stream with its SLOW chunk delay (250 ms between words,
+ * instead of 15 ms). It exists for the E-7 falsification: the window's count trigger needs K
+ * chunks, so the longer the gap between chunks, the longer the window holds the FIRST state back
+ * — and the measured first-visible delay must grow with it. A formula that cannot tell a 0 ms
+ * delay from a 10 s one would NOT grow.
  */
 export const measureUs7Turn = async (options?: {
   readonly maxPending?: number
   readonly words?: number
+  readonly slow?: boolean
   readonly browser?: Browser
 }): Promise<Us7Measurement> => {
   const maxPending = options?.maxPending ?? 4
   const words = options?.words ?? 30
+  const slow = options?.slow ?? false
   const browser = options?.browser ?? (await launchBrowser())
   // The switch goes to the BRAIN, not the browser: it changes the server's publish policy.
   const brain = await startBrain({ env: { OPENBOT_STREAM_WINDOW_MAX_PENDING: String(maxPending) } })
@@ -86,13 +133,25 @@ export const measureUs7Turn = async (options?: {
     await page.getByTestId("transcript").waitFor()
     await Bun.sleep(1200)
 
+    // The arm mark is taken HERE — just before the message is typed and sent. So the E-7 delay
+    // covers the whole path from "the user pressed send" to "the first intermediate state is on
+    // screen": the send itself, the server accepting it, the harness starting, the window
+    // buffering its first states, and the transport. That is the interval E-7 asks about
+    // ("首个可见中间态的延迟"), and it is measured on ONE clock (the page's), so it is a real
+    // elapsed time rather than a difference between two unrelated time bases.
     await page.evaluate(() => (window as any).__obClientChanges.reset())
     await page.evaluate(() => (window as any).__obClientChanges.arm())
     const started = Date.now()
-    const text = `echo: ${Array.from({ length: words }, (_, i) => `w${i}`).join(" ")}`
+    // `slow:` makes the fake harness stream with its SLOW chunk delay (250 ms between words
+    // instead of 15 ms) — the E-7 falsification construction. `echo:` is the normal one.
+    const wordsText = Array.from({ length: words }, (_, i) => `w${i}`).join(" ")
+    const text = `${slow ? "slow" : "echo"}: ${wordsText}`
     await page.getByRole("textbox", { name: "Message Us7" }).fill(text)
     await page.getByRole("textbox", { name: "Message Us7" }).press("Enter")
-    await page.getByTestId("transcript").getByText(`w${words - 1}`, { exact: false }).waitFor({ timeout: 60_000 })
+    // The BOT's bubble only: the owner's own message contains the same words, so a plain text
+    // match would be ambiguous between the two.
+    const botBubble = page.getByTestId("transcript").locator('[data-side="bot"]')
+    await botBubble.getByText(`w${words - 1}`, { exact: false }).first().waitFor({ timeout: 60_000 })
     await waitIdle(page, 60_000)
     await Bun.sleep(800)
     const turnMs = Date.now() - started
@@ -118,12 +177,20 @@ export const measureUs7Turn = async (options?: {
     const terminal = botEntries.find((i: { streaming: boolean }) => !i.streaming)
     const terminalMs = terminal === undefined || lastIntermediate === undefined ? -1 : Math.round(terminal.at - lastIntermediate.at)
     // The whole span, for reference: from the first intermediate state to the terminal.
-    const streamSpanMs = botEntries.length < 2 ? -1 : Math.round((botEntries.at(-1)?.at ?? 0) - (botEntries[0]?.at ?? 0))
+    //
+    // The first INTERMEDIATE state, not `botEntries[0]` — they are the same object in practice (the
+    // bot's first upsert is already `streaming: true`), but naming the intermediate one keeps the
+    // number's meaning independent of that coincidence.
+    const firstIntermediate = botEntries.find((i: { streaming: boolean }) => i.streaming)
+    const streamSpanMs = firstIntermediate === undefined || terminal === undefined ? -1 : Math.round(terminal.at - firstIntermediate.at)
     // E-7 / R-6: the delay until the FIRST intermediate state is visible to the client. The window
     // can hold the first state back (it is buffered until the count trigger or the stall
     // fallback), so this is the "does the stream still feel like a stream?" observation.
-    const firstIntermediate = botEntries.find((i: { streaming: boolean }) => i.streaming)
-    const firstVisibleMs = firstIntermediate === undefined ? -1 : Math.round(firstIntermediate.at - (botEntries[0]?.at ?? firstIntermediate.at))
+    //
+    // The reference point is the ARM MARK (the page clock, `performance.now()`), NOT the first
+    // item: the first item IS the first intermediate state, so subtracting one from the other
+    // would always be 0 — a measurement that cannot tell 0 ms from 10 s.
+    const firstVisibleMs = firstVisibleDelayMs(changes.armedAt ?? null, firstIntermediate?.at)
 
     await context.close()
     await rpc.close()
@@ -140,7 +207,9 @@ export const measureUs7Turn = async (options?: {
       terminalMs,
       streamSpanMs,
       firstVisibleMs,
+      armedAt: changes.armedAt ?? null,
       words,
+      slow,
     }
   } finally {
     await browser.close()
@@ -151,7 +220,9 @@ export const measureUs7Turn = async (options?: {
 // ----------------------------------------------------------------------------------- the runner
 
 if (import.meta.main) {
+  // `bun run us7-measure.ts <maxPending> [slow]`
   const maxPending = Number(process.argv[2] ?? 4)
-  const measurement = await measureUs7Turn({ maxPending })
+  const slow = process.argv[3] === "slow"
+  const measurement = await measureUs7Turn({ maxPending, slow })
   console.log(JSON.stringify(measurement, null, 2))
 }

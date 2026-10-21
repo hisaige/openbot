@@ -14,8 +14,9 @@
 
 import type { Browser, BrowserContext, Page } from "playwright-core"
 import { connectRpc, launchBrowser, type Rpc } from "./brain.ts"
-import { diffMetrics, measureDom, readPerformanceMetrics, timeScrollPage, traceReflow } from "./diagnostics.ts"
+import { diffMetrics, measureDom, readPerformanceMetrics, traceReflow } from "./diagnostics.ts"
 import { startSeededBrain, type SeededBrain } from "./fixture-brain.ts"
+import { SCROLL_TIMING_SCRIPT, timeScrollPageSplit } from "./scroll-timing.ts"
 
 export interface DiagnosticRun {
   readonly D_A_dom: ReadonlyArray<Record<string, unknown>>
@@ -62,6 +63,9 @@ export const runDiagnostics = async (options?: { readonly dev?: boolean; readonl
     })
     rpc = await connectRpc(seeded.brain as never)
     context = await browser.newContext({ viewport: { width: 1440, height: 900 }, colorScheme: "dark" })
+    // The scroll-timing probe has to be in the page BEFORE the app loads: it wraps `WebSocket` to
+    // see the history RPC's request and response frames.
+    await context.addInitScript(SCROLL_TIMING_SCRIPT)
     page = await context.newPage()
     const view = page
     page.setDefaultTimeout(30_000)
@@ -80,7 +84,7 @@ export const runDiagnostics = async (options?: { readonly dev?: boolean; readonl
     const first = await measureDom(page, "first screen (100 entries)", 0)
     dom.push({ ...first, state: "first screen (100 entries)", labels: LABELS })
     for (let i = 1; i <= pages; i++) {
-      await timeScrollPage(page)
+      await timeScrollPageSplit(page)
       await Bun.sleep(400)
       const m = await measureDom(page, `after ${i} page(s)`, i)
       dom.push({ ...m, state: `after ${i} page(s)`, labels: LABELS })
@@ -104,10 +108,30 @@ export const runDiagnostics = async (options?: { readonly dev?: boolean; readonl
     await cdp.detach()
 
     // ---------------------------------------------------------------- D-C: the scroll timing
-    const samples: Array<{ totalMs: number; serverMs: number; renderMs: number; added: number }> = []
+    //
+    // The parts are measured DIRECTLY (`scroll-timing.ts`), not by subtraction: the withdrawn
+    // algorithm computed `renderMs = totalMs - serverMs`, which put the harness's own settle-wait
+    // into the "render" leg and reported the same ~503 ms in every environment.
+    const samples: Array<{
+      appLatencyMs: number
+      rpcMs: number
+      commitMs: number
+      settleMs: number
+      userPerceivedMs: number
+      added: number
+    }> = []
     for (let i = 0; i < 5; i++) {
-      const timing = await timeScrollPage(page)
-      samples.push({ totalMs: timing.totalMs, serverMs: timing.serverMs, renderMs: timing.renderMs, added: timing.added })
+      const timing = await timeScrollPageSplit(page)
+      if (timing !== undefined) {
+        samples.push({
+          appLatencyMs: timing.appLatencyMs,
+          rpcMs: timing.rpcMs,
+          commitMs: timing.commitMs,
+          settleMs: timing.settleMs,
+          userPerceivedMs: timing.userPerceivedMs,
+          added: timing.added,
+        })
+      }
       await Bun.sleep(400)
     }
     const stat = (values: number[]) => ({
@@ -120,8 +144,8 @@ export const runDiagnostics = async (options?: { readonly dev?: boolean; readonl
     // As far up as the fixture goes: 2000 entries = 40 pages.
     const allPages: Array<Record<string, unknown>> = []
     for (let i = pages + 1; i <= 40; i++) {
-      const timing = await timeScrollPage(page)
-      if (timing.added === 0) break
+      const timing = await timeScrollPageSplit(page)
+      if (timing === undefined || timing.added === 0) break
       await Bun.sleep(300)
       if (i % 5 === 0) {
         const m = await measureDom(page, `after ${i} page(s)`, i)
@@ -145,9 +169,11 @@ export const runDiagnostics = async (options?: { readonly dev?: boolean; readonl
       },
       D_C_timing: {
         samples: samples.length,
-        totalMs: stat(samples.map((s) => s.totalMs)),
-        serverMs: stat(samples.map((s) => s.serverMs)),
-        renderMs: stat(samples.map((s) => s.renderMs)),
+        appLatencyMs: stat(samples.map((s) => s.appLatencyMs)),
+        rpcMs: stat(samples.map((s) => s.rpcMs)),
+        commitMs: stat(samples.map((s) => s.commitMs)),
+        settleMs: stat(samples.map((s) => s.settleMs)),
+        userPerceivedMs: stat(samples.map((s) => s.userPerceivedMs)),
         entriesPerPage: samples[0]?.added,
         labels: LABELS,
       },

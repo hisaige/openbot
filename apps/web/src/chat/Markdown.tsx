@@ -320,8 +320,21 @@ export interface MarkdownParseStats {
   readonly unchangedBodies: number
 }
 
-/** `bodyId` → the text it had at its last parse. */
+/**
+ * `bodyId` → the text it had at its last parse.
+ *
+ * IT IS BOUNDED. This map holds a FULL COPY of every message body it has seen, so an unbounded
+ * map would grow with the conversation and keep every message's text resident for the life of the
+ * tab — both a memory leak and a copy of the user's messages hanging around in a structure that
+ * nothing else clears. The oldest entries are evicted when the map passes `BODY_MEMORY_LIMIT`.
+ *
+ * The counter is OFF by default (`counting = false`), so the production path never fills this map
+ * at all — `recordParse` returns before touching it. The bound is the second line of defence for
+ * the case where the counter IS turned on (the measurements do that).
+ */
 const lastTextByBody = new Map<string, string>()
+/** How many bodies the text memory keeps. Beyond it, the oldest are dropped. */
+const BODY_MEMORY_LIMIT = 500
 /** The bodies that changed since the last reset (distinct, not per-parse). */
 const changedBodyIds = new Set<string>()
 /** The bodies that were re-parsed with the same text since the last reset (distinct). */
@@ -352,6 +365,14 @@ export const markdownParseStats = (): MarkdownParseStats => ({
   unchangedBodies: unchangedBodyIds.size,
 })
 
+/**
+ * How many bodies the text memory is holding.
+ *
+ * Exposed so the bound can be TESTED (it is a memory limit — a test that cannot see it is a test
+ * that cannot catch it growing). It counts bodies, not texts, and it never exposes the texts.
+ */
+export const markdownParseStatsBodyCount = (): number => lastTextByBody.size
+
 /** Clears the three counters; the per-body text memory survives (C-10). */
 export const resetMarkdownParseStats = (): void => {
   counters.parses = 0
@@ -377,12 +398,31 @@ const recordParse = (bodyId: string | undefined, text: string): void => {
   const previous = lastTextByBody.get(bodyId)
   if (previous === undefined) {
     // First parse of this body: not a change (there is nothing to have changed from).
-    lastTextByBody.set(bodyId, text)
+    rememberBodyText(bodyId, text)
     return
   }
   if (previous === text) unchangedBodyIds.add(bodyId)
   else changedBodyIds.add(bodyId)
+  rememberBodyText(bodyId, text)
+}
+
+/**
+ * Stores a body's text, evicting the oldest entries when the memory is full.
+ *
+ * A `Map` iterates in insertion order, so the first key is the oldest one. Re-inserting a key
+ * (`set` on an existing key) keeps its ORIGINAL position, so a body that is re-parsed often does
+ * not move to the back — it is re-inserted after a delete, which is what the streaming body needs
+ * (it must stay resident while it streams).
+ */
+const rememberBodyText = (bodyId: string, text: string): void => {
+  // Delete first, so a re-parse moves the body to the young end of the map.
+  lastTextByBody.delete(bodyId)
   lastTextByBody.set(bodyId, text)
+  while (lastTextByBody.size > BODY_MEMORY_LIMIT) {
+    const oldest = lastTextByBody.keys().next()
+    if (oldest.done === true) break
+    lastTextByBody.delete(oldest.value)
+  }
 }
 
 /** Renders plain text with only `@Bot` mentions styled (user bubbles). */

@@ -37,6 +37,16 @@ export interface ClientChangeCounts {
   readonly entryIds: ReadonlyArray<string>
   /** The text of the last upsert per entry id — the terminal text, for the byte-for-byte check. */
   readonly lastTextByEntry: Readonly<Record<string, string>>
+  /**
+   * The page clock at the moment the counter was armed — the reference point for "how long until
+   * the client saw the first intermediate state" (E-7).
+   *
+   * It is `performance.now()` in the PAGE, on the same clock as every item's `at`, so the two can
+   * be subtracted. `Date.now()` (the harness's clock) cannot: it is a different time base.
+   *
+   * `null` before the first `arm()`.
+   */
+  readonly armedAt: number | null
 }
 
 export const emptyCounts = (): ClientChangeCounts => ({
@@ -45,6 +55,7 @@ export const emptyCounts = (): ClientChangeCounts => ({
   terminalUpserted: 0,
   entryIds: [],
   lastTextByEntry: {},
+  armedAt: null,
 })
 
 /**
@@ -63,6 +74,8 @@ export const CLIENT_CHANGE_SCRIPT = `
     entryIds: [],
     lastTextByEntry: {},
     items: [],
+    // The page clock at the moment the counter was armed (E-7's reference point).
+    armedAt: null,
   };
   // The window the test measures: only items after this point count.
   let armed = false;
@@ -104,7 +117,11 @@ export const CLIENT_CHANGE_SCRIPT = `
   }
   globalThis.WebSocket = Wrapped;
   window.__obClientChanges = {
-    arm() { armed = true; },
+    // The arm mark is on the PAGE's clock (performance.now), the same clock every item's "at"
+    // uses — so "how long until the client saw the first intermediate state" is a subtraction of
+    // two numbers on the same clock. The harness's Date.now() is a different time base and cannot
+    // be subtracted from an item's "at".
+    arm() { armed = true; counts.armedAt = performance.now(); },
     disarm() { armed = false; },
     read() { return JSON.parse(JSON.stringify(counts)); },
     reset() {
@@ -114,6 +131,10 @@ export const CLIENT_CHANGE_SCRIPT = `
       counts.entryIds = [];
       counts.lastTextByEntry = {};
       counts.items = [];
+      // The arm mark is reset too: a reset means "start measuring from here", so the reference
+      // point has to move with it. Otherwise the next measurement would be relative to a stale
+      // arm and would read as a huge delay.
+      counts.armedAt = null;
     },
   };
 })();
@@ -126,7 +147,6 @@ export interface ClientChangeHandle {
   readonly read: () => ClientChangeCounts & { readonly items: ReadonlyArray<{ entryId: string; streaming: boolean; text: string; conversationId: string; role?: string; kind?: string; at: number }> }
   readonly reset: () => void
 }
-
 /**
  * The script that turns the parse counter ON before the app loads.
  *

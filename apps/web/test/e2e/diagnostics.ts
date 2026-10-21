@@ -1,5 +1,7 @@
-// The three diagnostics (architecture §5.3): DOM node count (D-A), forced reflow (D-B) and the
-// scroll timing breakdown (D-C).
+// The three diagnostics (architecture §5.3): DOM node count (D-A) and forced reflow (D-B).
+//
+// D-C (the scroll timing) IS NOT HERE — it was withdrawn and replaced by `scroll-timing.ts`. See
+// the D-C section at the bottom of this file for why.
 //
 // Every measurement carries the four labels the PRD demands (US-8 / architecture §8.2): the
 // working set, the cold/hot state, the sampling method and the same-basis control. The types
@@ -248,76 +250,19 @@ const attribute = (
 }
 
 // --------------------------------------------------------------------------------------------- D-C
-
-/** The parts of one scroll-to-the-top action. */
-export interface ScrollTiming {
-  /** The total time from "the user scrolled to the top" to "the older message is on screen". */
-  readonly totalMs: number
-  /** The time spent waiting for the server (the RPC round trip). */
-  readonly serverMs: number
-  /** The time spent rendering locally after the page arrived. */
-  readonly renderMs: number
-  /** The time not accounted for by the two above. */
-  readonly remainderMs: number
-  /** How many entries the page added. */
-  readonly added: number
-}
-
-/**
- * Times one "scroll to the top" page load.
- *
- * The marks are: the scroll action, the moment the page arrives (the DOM grows), and the total.
- * The server leg is the time from the scroll to the page's arrival; the render leg is what React
- * does after the state changed, which the CDP metrics measure separately.
- *
- * IT WAITS FOR THE COUNT TO SETTLE, not just to grow — a second page load can start right after
- * the first one finishes.
- *
- * IT REPORTS `added: 0` WHEN NOTHING WAS LOADED — at the very top of the conversation there is no
- * older history left, so the scroll is a no-op. A zero there is a fact about the state, not a
- * measurement failure.
- */
-export const timeScrollPage = async (page: Page): Promise<ScrollTiming> => {
-  const started = Date.now()
-  // IT SCROLLS LIKE A USER: a real wheel event, not `scrollTop = 0` plus a synthetic `scroll`
-  // event. The synthetic version fires the app's scroll handler TWICE (the native scroll event
-  // from setting `scrollTop` and the explicit `dispatchEvent`), and the second one can start a
-  // second page load once the first has finished — which showed up as "scroll 5 loaded 100
-  // entries" instead of 50. A real wheel event loads exactly one page.
-  await page.locator('[data-testid="transcript"]').hover()
-  // A wheel scroll of -100000 px reaches the top of any scroll container.
-  await page.mouse.wheel(0, -100_000)
-  const result = await page.evaluate(async () => {
-    const before = document.querySelectorAll("[data-entry]").length
-    const t0 = performance.now()
-    // The app's scroll handler calls `loadOlder`; the page grows when the response is applied.
-    const deadline = performance.now() + 15_000
-    let serverDone = 0
-    let last = before
-    let stableSince = 0
-    while (performance.now() < deadline) {
-      await new Promise((r) => setTimeout(r, 25))
-      const now = document.querySelectorAll("[data-entry]").length
-      if (now > before && serverDone === 0) serverDone = performance.now() - t0
-      // The count has to be stable for a while before the measurement is trusted: a second page
-      // load can start right after the first one finishes.
-      if (now === last) {
-        if (stableSince === 0) stableSince = performance.now()
-        else if (performance.now() - stableSince > 400) break
-      } else {
-        last = now
-        stableSince = 0
-      }
-    }
-    const after = document.querySelectorAll("[data-entry]").length
-    return { serverDone, added: after - before, settled: performance.now() - t0 }
-  })
-  const totalMs = Date.now() - started
-  // A scroll that loaded nothing is not a server round trip: the server was never asked.
-  const serverMs = result.added === 0 ? 0 : result.serverDone
-  const renderMs = result.added === 0 ? 0 : Math.max(0, totalMs - serverMs)
-  return { totalMs, serverMs, renderMs, remainderMs: 0, added: result.added }
-}
+//
+// THE D-C MEASUREMENT IS NOT HERE. It used to be: `timeScrollPage` split the scroll into "server"
+// and "render" by SUBTRACTION (`renderMs = totalMs - serverMs`, where `serverMs` was the moment
+// the entry count first grew). That algorithm was WITHDRAWN (handoff §7 D-3) because the
+// subtraction put the harness's own 400 ms settle-wait into the "render" leg — it reported
+// ~503 ms in EVERY environment, on a 350-row DOM and on a 1900-row DOM alike, and a real React
+// commit does not cost the same on both.
+//
+// The replacement is `scroll-timing.ts`'s `timeScrollPageSplit`, which marks each step DIRECTLY
+// (request frame out → response frame in → DOM grows) and reports the settle wait separately.
+//
+// It is kept out of this file rather than merely deprecated so that no caller can reach for it by
+// accident: a withdrawn algorithm that is still exported is one more thing to notice.
 
 /** The median of a list of numbers. */
 export const median = (values: ReadonlyArray<number>): number => {
