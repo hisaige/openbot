@@ -96,7 +96,14 @@ export interface ReflowAttribution {
   /** `Blink.ForcedStyleAndLayout.UpdateTime` events — the forced-reflow marker. */
   readonly forcedReflows: number
   /** The function that was running when each forced reflow happened. */
-  readonly attributedTo: ReadonlyArray<{ readonly fn: string; readonly url: string; readonly line: number; readonly count: number }>
+  readonly attributedTo: ReadonlyArray<{
+    readonly fn: string
+    readonly url: string
+    readonly line: number
+    readonly count: number
+    /** The whole JS stack at that instant, innermost first. */
+    readonly chain: ReadonlyArray<string>
+  }>
   /** Forced reflows that could not be attributed to a function. */
   readonly unattributed: number
 }
@@ -182,19 +189,27 @@ const attribute = (
     t += delta
     sampleTimes.push(t)
   }
-  const named = (nodeId: number): { fn: string; url: string; line: number } | undefined => {
+  /**
+   * The whole stack of the frame, innermost first.
+   *
+   * The leaf is usually a framework internal (React's `recursivelyTraverseLayoutEffects`, a
+   * `dispatchEvent`), which names the MECHANISM but not the app code that caused it. The app's own
+   * frame is further up — so the whole chain is reported, and the caller can see which app
+   * function is in it.
+   */
+  const chainOf = (nodeId: number): ReadonlyArray<{ fn: string; url: string; line: number }> => {
+    const out: Array<{ fn: string; url: string; line: number }> = []
     let node: ProfileNode | undefined = byId.get(nodeId)
-    // Walk up to the nearest frame with a name: the leaf is often an anonymous callback.
     while (node !== undefined) {
       const name = node.callFrame?.functionName ?? ""
       if (name !== "" && name !== "(root)" && name !== "(program)" && name !== "(idle)") {
-        return { fn: name, url: node.callFrame?.url ?? "", line: (node.callFrame?.lineNumber ?? -1) + 1 }
+        out.push({ fn: name, url: node.callFrame?.url ?? "", line: (node.callFrame?.lineNumber ?? -1) + 1 })
       }
       node = node.parent === undefined ? undefined : byId.get(node.parent)
     }
-    return undefined
+    return out
   }
-  const byFn = new Map<string, { fn: string; url: string; line: number; count: number }>()
+  const byFn = new Map<string, { fn: string; url: string; line: number; count: number; chain: ReadonlyArray<string> }>()
   let unattributed = 0
   let forced = 0
   for (const event of traceEvents) {
@@ -213,14 +228,15 @@ const attribute = (
       unattributed++
       continue
     }
-    const frame = named(sampleId)
+    const chain = chainOf(sampleId)
+    const frame = chain[0]
     if (frame === undefined) {
       unattributed++
       continue
     }
     const key = `${frame.fn}|${frame.url}|${frame.line}`
     const existing = byFn.get(key)
-    if (existing === undefined) byFn.set(key, { ...frame, count: 1 })
+    if (existing === undefined) byFn.set(key, { ...frame, count: 1, chain: chain.map((c) => c.fn) })
     else existing.count++
   }
   return {
