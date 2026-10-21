@@ -51,6 +51,8 @@ export interface Us7Measurement {
   readonly terminalMs: number
   /** From the first intermediate state to the terminal (the whole stream span). */
   readonly streamSpanMs: number
+  /** E-7 (observation, not a criterion): the delay until the first intermediate state arrives. */
+  readonly firstVisibleMs: number
   /** How many words the turn streamed (N). */
   readonly words: number
 }
@@ -117,6 +119,11 @@ export const measureUs7Turn = async (options?: {
     const terminalMs = terminal === undefined || lastIntermediate === undefined ? -1 : Math.round(terminal.at - lastIntermediate.at)
     // The whole span, for reference: from the first intermediate state to the terminal.
     const streamSpanMs = botEntries.length < 2 ? -1 : Math.round((botEntries.at(-1)?.at ?? 0) - (botEntries[0]?.at ?? 0))
+    // E-7 / R-6: the delay until the FIRST intermediate state is visible to the client. The window
+    // can hold the first state back (it is buffered until the count trigger or the stall
+    // fallback), so this is the "does the stream still feel like a stream?" observation.
+    const firstIntermediate = botEntries.find((i: { streaming: boolean }) => i.streaming)
+    const firstVisibleMs = firstIntermediate === undefined ? -1 : Math.round(firstIntermediate.at - (botEntries[0]?.at ?? firstIntermediate.at))
 
     await context.close()
     await rpc.close()
@@ -132,6 +139,7 @@ export const measureUs7Turn = async (options?: {
       turnMs,
       terminalMs,
       streamSpanMs,
+      firstVisibleMs,
       words,
     }
   } finally {
