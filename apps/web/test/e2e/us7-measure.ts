@@ -24,11 +24,20 @@ import { connectRpc, launchBrowser, startBrain, waitIdle } from "./brain.ts"
 import { CLIENT_CHANGE_SCRIPT } from "./client-changes.ts"
 
 export interface Us7Measurement {
-  /** `entry.upserted` changes the CLIENT applied during the turn (C-1's counting point). */
+  /**
+   * The `entry.upserted` changes the CLIENT applied to THE STREAMING ENTRY (C-1's counting point).
+   *
+   * "一个回合 = 一个 entry 的流式生命周期" (C-1): the turn is ONE entry's streaming lifecycle, and
+   * the criterion's own arithmetic uses an N+1 denominator — N intermediate states plus ONE
+   * terminal, for that entry. So the owner's own message (which is also upserted twice: `accepted`
+   * then `delivered`) is NOT part of the turn and is not counted.
+   */
   readonly entryUpserted: number
-  /** Of those, the intermediate states (`streaming: true`). */
+  /** Every `entry.upserted` the client applied in the window, including the owner's message. */
+  readonly entryUpsertedAll: number
+  /** Of the streaming entry's, the intermediate states (`streaming: true`). */
   readonly streamingUpserted: number
-  /** Of those, the terminal state (`streaming: false`). */
+  /** Of the streaming entry's, the terminal state (`streaming: false`). */
   readonly terminalUpserted: number
   /** The intermediate states the client OBSERVED for the bot's message (US-7's first criterion). */
   readonly observedIntermediate: number
@@ -89,6 +98,10 @@ export const measureUs7Turn = async (options?: {
     const changes = await page.evaluate(() => (window as any).__obClientChanges.read())
     // The bot's message: the last entry the client saw that is not the owner's message.
     const botEntries = changes.items.filter((i: { role?: string; conversationId: string; streaming: boolean; text: string; at: number }) => i.role === "bot" && i.conversationId === bot.directConversationId)
+    // The streaming entry is ONE entry: the bot's message. Its upserts are the turn's changes.
+    // (The owner's message is upserted too — `accepted` then `delivered` — but it is not part of
+    // this entry's streaming lifecycle, so it is not counted; C-1's own arithmetic uses N+1.)
+    const streamEntryId = botEntries[0]?.entryId
     const observedIntermediate = botEntries.filter((i: { streaming: boolean }) => i.streaming).length
     const finalText = botEntries.at(-1)?.text ?? ""
     // US-7's fourth criterion: "the turn's terminal update must reach the client and be applied
@@ -107,10 +120,12 @@ export const measureUs7Turn = async (options?: {
 
     await context.close()
     await rpc.close()
+    const streamEntries = botEntries.filter((i: { entryId?: string }) => i.entryId === streamEntryId)
     return {
-      entryUpserted: changes.entryUpserted,
-      streamingUpserted: changes.streamingUpserted,
-      terminalUpserted: changes.terminalUpserted,
+      entryUpserted: streamEntries.length,
+      entryUpsertedAll: changes.entryUpserted,
+      streamingUpserted: streamEntries.filter((i: { streaming: boolean }) => i.streaming).length,
+      terminalUpserted: streamEntries.filter((i: { streaming: boolean }) => !i.streaming).length,
       observedIntermediate,
       finalText,
       maxPending,
