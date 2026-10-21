@@ -7,9 +7,34 @@ import { Toaster } from "@openbot/ui"
 import { App } from "./app/App.tsx"
 import { desktopApp } from "./app/notifications.ts"
 import { QuickSend } from "./quick/QuickSend.tsx"
+import { enableMarkdownParseStats, markdownParseStats, resetMarkdownParseStats } from "./chat/Markdown.tsx"
 
+declare global {
+  interface Window {
+    /** The parse counters (US-6's criterion). Counts only — never the text. */
+    __obMarkdownParseStats: () => { readonly parses: number; readonly changedBodies: number; readonly unchangedBodies: number }
+    /** Clears the counters. The per-body text memory survives. */
+    __obResetMarkdownParseStats: () => void
+  }
+}
 const root = document.getElementById("root")
 if (!root) throw new Error("#root missing from index.html")
+
+// The parse counter (US-6) is OFF by default: the app's normal path pays one branch and nothing
+// else. It is turned on by a flag instead of by an API call, because it has to be on from the
+// VERY FIRST render — the counter attributes a re-parse to "the same text as last time", and the
+// per-body memory is filled by the first render. Enabling it later would make every body look
+// like a first parse, and the baseline measurement (unchangedBodies ≈ K-1) would come out as 0 —
+// a false pass.
+//
+// The flag is a `sessionStorage` key, NOT a URL parameter: the app rewrites the hash on every
+// route change (`uiState.ts`'s `select` replaces it with `#/c/<id>`), so a query parameter put
+// after the hash would be dropped before the app ever read it. `sessionStorage` survives the
+// navigation (it is per-tab) and is readable synchronously before the first render.
+const PARSE_STATS_KEY = "obParseStats"
+if (typeof sessionStorage !== "undefined" && sessionStorage.getItem(PARSE_STATS_KEY) === "1") {
+  enableMarkdownParseStats()
+}
 
 // In the desktop app (apps/desktop): `data-desktop` = its platform. On macOS the window has no title
 // bar: a strip along the top moves it (app.css `.ob-titlebar`), first in the page so the buttons
@@ -38,3 +63,8 @@ createRoot(root).render(
     </RegistryProvider>
   </StrictMode>,
 )
+
+// The parse counters (US-6): the measurement hook the diagnostic e2e reads. The counter itself is
+// off until someone turns it on, so the app's normal path pays one branch and nothing else.
+window.__obMarkdownParseStats = markdownParseStats
+window.__obResetMarkdownParseStats = resetMarkdownParseStats

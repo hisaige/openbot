@@ -25,15 +25,31 @@ export const useRoster = (): RosterView => {
   const result = useAtomValue(rosterAtom)
   const state = valueOr(result, emptyRosterState)
   const loaded = AsyncResult.isSuccess(result) && state.cursor !== undefined
-  return useMemo(() => {
-    const bots = [...state.bots.values()].sort((a, b) => a.name.localeCompare(b.name))
-    return {
+  // The `bots` array gets its OWN memo, keyed on `state.bots` — not on `state`.
+  //
+  // `state` gets a new reference on EVERY roster change (`applyRosterChange` returns
+  // `{...state, ...}` in every case), so a `bots` array derived from it would change identity on
+  // every change too — and that identity is what `Markdown`'s `React.memo` compares. If `bots`
+  // changed on every unrelated change (activity updates, notifications, conversation summaries —
+  // all of which arrive while a bot is streaming), the memo would never hit and US-6's
+  // "only the changing message is re-parsed" would not hold.
+  //
+  // `state.bots` is the Map the reducer only replaces in the `bot.upserted` / `bot.removed` cases,
+  // so it — and therefore `bots` — keeps its identity across every other change. When the bot
+  // list really does change, a new `bots` array is correct: the messages have to be re-rendered.
+  //
+  // This deliberately does NOT stabilise the whole `useRoster` result: `state` still changes
+  // identity, and its ~29 consumers in `apps/web/src/` depend on that.
+  const bots = useMemo(() => [...state.bots.values()].sort((a, b) => a.name.localeCompare(b.name)), [state.bots])
+  return useMemo(
+    () => ({
       state,
       loaded,
       bots,
       botById: (id) => (id === undefined ? undefined : state.bots.get(id as BotId)),
-    }
-  }, [state, loaded])
+    }),
+    [state, loaded, bots],
+  )
 }
 
 export const useSessionInfo = () => useAtomValue(sessionInfoAtom)

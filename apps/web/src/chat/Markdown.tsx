@@ -4,7 +4,7 @@
 // (avatar + name in the Bot's colour, Grok style). Links only allow http(s), mailto and
 // same-origin relative URLs, images only https and attachments; anything else renders as plain text.
 import { Globe } from "lucide-react"
-import { Fragment, type ReactNode, useState } from "react"
+import { Fragment, memo, type ReactNode, useState } from "react"
 import { Avatar } from "@openbot/ui"
 import { imageSrc, safeHref } from "@openbot/app-model"
 
@@ -300,8 +300,101 @@ export const renderInline = (text: string, keyPrefix = "i", scope: MentionScope 
 
 // ------------------------------------------------------------------------------------------ render
 
+/**
+ * The parse counter (architecture §2.6): how often `parseBlocks` runs, and how many of those runs
+ * were re-parses of a message body whose text had NOT changed.
+ *
+ * US-6 asks for "the number of message bodies re-parsed during one streaming turn ≤ 2". The
+ * repository has no render counter of any kind, so this is the instrumentation that makes the
+ * criterion measurable at all.
+ *
+ * The counter is OFF by default: `counting` is false until `enableMarkdownParseStats()` is
+ * called, so the production path pays one branch and nothing else.
+ */
+export interface MarkdownParseStats {
+  /** How many times `parseBlocks` ran since the last reset. */
+  readonly parses: number
+  /** How many DISTINCT message bodies were parsed with a text different from their last parse. */
+  readonly changedBodies: number
+  /** How many DISTINCT message bodies were parsed with a text IDENTICAL to their last parse. */
+  readonly unchangedBodies: number
+}
+
+/** `bodyId` → the text it had at its last parse. */
+const lastTextByBody = new Map<string, string>()
+/** The bodies that changed since the last reset (distinct, not per-parse). */
+const changedBodyIds = new Set<string>()
+/** The bodies that were re-parsed with the same text since the last reset (distinct). */
+const unchangedBodyIds = new Set<string>()
+const counters = { parses: 0 }
+let counting = false
+
+/**
+ * Turns the counter on. Off by default so the production path costs one `if`.
+ *
+ * `resetMarkdownParseStats()` clears the three counters but KEEPS the per-body text memory
+ * (architecture §2.6, C-10): without it, the first parse of a turn could not be told apart from
+ * "the state before the turn".
+ */
+export const enableMarkdownParseStats = (): void => {
+  counting = true
+}
+
+/** Turns the counter off again (the default). */
+export const disableMarkdownParseStats = (): void => {
+  counting = false
+}
+
+/** The three counters. */
+export const markdownParseStats = (): MarkdownParseStats => ({
+  parses: counters.parses,
+  changedBodies: changedBodyIds.size,
+  unchangedBodies: unchangedBodyIds.size,
+})
+
+/** Clears the three counters; the per-body text memory survives (C-10). */
+export const resetMarkdownParseStats = (): void => {
+  counters.parses = 0
+  changedBodyIds.clear()
+  unchangedBodyIds.clear()
+}
+
+/**
+ * Records one `parseBlocks` call.
+ *
+ * `bodyId` is the message's entry id. Without one (a file preview, a card summary) the parse still
+ * counts towards `parses`, but the body is not attributed to any message (C-8) — so it lands in
+ * neither `changedBodies` nor `unchangedBodies`.
+ *
+ * `changedBodies` and `unchangedBodies` count DISTINCT bodies, not parses: a message that is
+ * re-parsed 30 times while it streams is ONE changed body, not thirty. That is what US-6 asks
+ * ("the number of message bodies re-parsed"), and it is why the sets are used rather than counters.
+ */
+const recordParse = (bodyId: string | undefined, text: string): void => {
+  if (!counting) return
+  counters.parses++
+  if (bodyId === undefined) return
+  const previous = lastTextByBody.get(bodyId)
+  if (previous === undefined) {
+    // First parse of this body: not a change (there is nothing to have changed from).
+    lastTextByBody.set(bodyId, text)
+    return
+  }
+  if (previous === text) unchangedBodyIds.add(bodyId)
+  else changedBodyIds.add(bodyId)
+  lastTextByBody.set(bodyId, text)
+}
+
 /** Renders plain text with only `@Bot` mentions styled (user bubbles). */
-export function MentionText({ text, bots, tone = "inherit" }: { readonly text: string; readonly bots: ReadonlyArray<MentionBot>; readonly tone?: "bot" | "inherit" }): ReactNode {
+export const MentionText = memo(function MentionText({
+  text,
+  bots,
+  tone = "inherit",
+}: {
+  readonly text: string
+  readonly bots: ReadonlyArray<MentionBot>
+  readonly tone?: "bot" | "inherit"
+}): ReactNode {
   const scope = makeMentionScope(bots, tone)
   const rule = mentionRule(scope)
   if (rule === undefined) return text
@@ -315,9 +408,25 @@ export function MentionText({ text, bots, tone = "inherit" }: { readonly text: s
   }
   if (rest) out.push(rest)
   return <>{out}</>
-}
+})
 
-export function Markdown({ text, className, bots }: { readonly text: string; readonly className?: string; readonly bots?: ReadonlyArray<MentionBot> }): ReactNode {
+export const Markdown = memo(function Markdown({
+  text,
+  className,
+  bots,
+  bodyId,
+}: {
+  readonly text: string
+  readonly className?: string
+  readonly bots?: ReadonlyArray<MentionBot>
+  /**
+   * The message body's stable id (the entry id). Used ONLY by the parse counter (US-6's
+   * criterion); it does not take part in rendering. Absent → the parse counts towards `parses`
+   * but is attributed to no body (C-8).
+   */
+  readonly bodyId?: string
+}): ReactNode {
+  recordParse(bodyId, text)
   const blocks = parseBlocks(text)
   const previous = currentScope
   currentScope = bots === undefined ? undefined : makeMentionScope(bots, "bot")
@@ -326,7 +435,7 @@ export function Markdown({ text, className, bots }: { readonly text: string; rea
   } finally {
     currentScope = previous
   }
-}
+})
 
 const alignClass = (a: "left" | "center" | "right" | undefined) => (a === "center" ? "text-center" : a === "right" ? "text-right" : "text-left")
 

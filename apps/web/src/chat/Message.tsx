@@ -131,7 +131,7 @@ export function MessageBubble({ entry, position, conversationId, quoted, onReply
                 <span className="truncate">“{plainPreview(quoted.text, 80)}”</span>
               </span>
             )}
-            {side === "bot" && !emoji ? <Markdown text={entry.text} bots={roster.bots} /> : emoji ? entry.text : <MentionText text={entry.text} bots={roster.bots} />}
+            {side === "bot" && !emoji ? <Markdown text={entry.text} bots={roster.bots} bodyId={entry.id} /> : emoji ? entry.text : <MentionText text={entry.text} bots={roster.bots} />}
             {entry.aborted && <span className="ms-1 text-sm opacity-70">(stopped)</span>}
             {reactions.length > 0 && (
               <span className={cn("absolute -top-4 flex gap-0.5", side === "user" ? "-start-3" : "-end-3")}>
