@@ -34,7 +34,7 @@
  * Requirements only name tags from LOWER layers (services.ts header). `@openbot/core` re-exports
  * this barrel.
  */
-export { LiveHubLive } from "./LiveHub.ts"
+export { LiveHubLive, makeLiveHubLayer, type LiveHubOptions, type LiveHubPublishWindow } from "./LiveHub.ts"
 export { ConversationServiceLive, groupTitleFor, MAX_HISTORY_LIMIT } from "./ConversationService.ts"
 export { NotifierLive } from "./Notifier.ts"
 export { AttachmentServiceLive, MAX_ATTACHMENT_BYTES, storeAttachmentStream, toAttachment } from "./AttachmentService.ts"

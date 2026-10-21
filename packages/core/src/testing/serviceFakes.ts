@@ -8,7 +8,8 @@
  * Each fake comes with a control service (`*Fake`) to drive and inspect it, like the port fakes.
  *
  * - `LiveHubFake`: records every publish with a per-replica cursor; subscriptions stream
- *   `synchronized` then live items (no snapshots).
+ *   `synchronized` then live items (no snapshots). **No publish window** (see its own doc
+ *   comment): it sees more changes than production does.
  * - `ConversationServiceFake`: the transcript-write subset over EntryRepo/RequestRepo/ConversationRepo
  *   + LiveHub (append/update/remove entries, events, notices, requests, routine-run conversations).
  * - `OrchestratorFake`: records deliveries; `awaitDelivery` resolves via `complete` or `autoComplete`.
@@ -96,6 +97,25 @@ type HubItem =
   | { readonly replicaKey: ReplicaKey; readonly conversation: KnownConversationStreamItem }
   | { readonly replicaKey: ReplicaKey; readonly roster: KnownRosterStreamItem }
 
+/**
+ * A recording stand-in for `LiveHub`: it appends every change to a per-replica cursor and
+ * remembers it. Subscriptions stream `synchronized` then live items (no snapshots).
+ *
+ * **It does NOT implement the publish window** (architecture §2.2.4). The window is a publishing
+ * strategy of `LiveHubLive` and needs a timer fiber bound to a `Scope`; this fake is
+ * `Layer.effectContext` (no scope), and adding timers to a "lightweight stand-in" would give it
+ * races it has no business having.
+ *
+ * **Consequence, and it matters for any test that counts changes**: `LiveHubFake` sees **more**
+ * changes than production does — one per publish, with no merging. So:
+ *
+ * - a test that asserts "the window merged N changes into 1" **must** use `LiveHubLive`;
+ * - a test that asserts how many changes the **client** applied must count at the client, not
+ *   here (the counting point is fixed by the product spec §2.8 C-1);
+ * - the existing `serviceFakes.test.ts` assertion of two `entry.upserted` changes still holds:
+ *   they are **event** entries, and `isStreamingUpsert` is false for an event, so they would not
+ *   enter the window even under `LiveHubLive`.
+ */
 export class LiveHubFake extends Context.Service<LiveHubFake, {
   /** Every published change (both replicas), oldest first. */
   readonly published: Effect.Effect<ReadonlyArray<PublishedChange>>

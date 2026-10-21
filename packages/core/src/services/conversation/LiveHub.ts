@@ -17,6 +17,7 @@ import type {
   BotId,
   Card,
   ConversationId,
+  EntryId,
   KnownConversationChange,
   KnownConversationStreamItem,
   KnownRosterChange,
@@ -25,8 +26,8 @@ import type {
   RequestId,
   StreamCursor,
 } from "@openbot/contracts"
-import { MAX_REPLAY_GAP, SNAPSHOT_TAIL_ENTRIES } from "@openbot/contracts"
-import { Effect, Layer, Option, PubSub, Semaphore, Stream } from "effect"
+import { isStreamingUpsert, MAX_REPLAY_GAP, SNAPSHOT_TAIL_ENTRIES } from "@openbot/contracts"
+import { Clock, Duration, Effect, Layer, Option, PubSub, Semaphore, Stream } from "effect"
 import { IdGen } from "../../ports/IdGen.ts"
 import { NodeDirectory } from "../../ports/NodeDirectory.ts"
 import {
@@ -63,6 +64,65 @@ const SNAPSHOT_TURNS = 20
 /** Upper bound for a client-requested `tailLimit`. */
 const MAX_TAIL_LIMIT = 500
 
+// --------------------------------------------------------------------------- the publish window
+
+/**
+ * The publish window (architecture §2.2.2 / §2.3): still-growing `entry.upserted` changes are
+ * buffered per entry instead of being published one by one, so a streaming turn reaches the client
+ * in batches. Two things end a buffer:
+ *
+ * - the **count trigger**: the entry reached `maxPending` buffered changes → publish the latest one;
+ * - the **stall fallback**: the entry's buffer has not been updated for `stallMs` → publish it
+ *   (keep-alive for a stream that stopped without a terminal upsert).
+ *
+ * There is deliberately **no time-based tick**: a fixed "flush everything every W ms" degenerates
+ * into "one change per token" on any harness whose token interval exceeds W, which breaks the
+ * change-count budget outright (architecture §2.3.4).
+ */
+export interface LiveHubPublishWindow {
+  /** Turning it off restores the pre-window behaviour (one change → one sequence → one publish). Default true. */
+  readonly enabled: boolean
+  /**
+   * Stall fallback: an entry whose buffered change has not been updated for this long is published
+   * (keep-alive). It is **not** a ticker — while the stream keeps advancing it never fires.
+   * Default 2000.
+   */
+  readonly stallMs: number
+  /** Count trigger: `maxPending` buffered changes for one entry publish it. Default 4. */
+  readonly maxPending: number
+}
+
+export interface LiveHubOptions {
+  readonly publishWindow?: Partial<LiveHubPublishWindow> | undefined
+}
+
+const DEFAULT_PUBLISH_WINDOW: LiveHubPublishWindow = { enabled: true, stallMs: 2000, maxPending: 4 }
+
+/** What the window holds for one entry. */
+interface PendingEntry {
+  /** The newest buffered change — the one that gets published when the entry is flushed. */
+  readonly latest: KnownConversationChange
+  /** How many changes are buffered for this entry (reset when it is flushed). */
+  readonly count: number
+  /** When the buffer was last updated (ms). */
+  readonly lastUpdatedAt: number
+}
+
+/** The window's state for one conversation replica. */
+interface PublishWindowState {
+  /** Buffered changes, per entry. */
+  readonly pending: Map<EntryId, PendingEntry>
+  /**
+   * Entries whose buffer was already flushed at least once in this turn. C-2: the terminal-upsert
+   * branch is decided by "has this entry been flushed before", **not** by the current buffer size
+   * (the buffer is always below `maxPending` after a flush, so a size test cannot express it).
+   * Kept even after the buffer empties, so the fact stays evaluable.
+   */
+  readonly flushed: Set<EntryId>
+  /** A trailing timer is running (one per replica). */
+  timerScheduled: boolean
+}
+
 const cardRequestId = (card: Card): RequestId | undefined =>
   card.type === "approval" || card.type === "form" || card.type === "secret-request" || card.type === "handoff" ||
     card.type === "question"
@@ -73,7 +133,10 @@ const sameActivity = (a: BotActivity | undefined, b: BotActivity): boolean =>
   a !== undefined && a.state === b.state && a.label === b.label && a.toolKind === b.toolKind &&
   a.conversationId === b.conversationId
 
-export const LiveHubLive: Layer.Layer<
+/** The LiveHub layer with custom options (the publish window); `LiveHubLive` uses the defaults. */
+export const makeLiveHubLayer = (
+  options?: LiveHubOptions,
+): Layer.Layer<
   LiveHub,
   never,
   | ReplicaLog
@@ -87,9 +150,11 @@ export const LiveHubLive: Layer.Layer<
   | TaskRepo
   | NodeDirectory
   | IdGen
-> = Layer.effect(
-  LiveHub,
-  Effect.gen(function*() {
+> =>
+  Layer.effect(
+    LiveHub,
+    Effect.gen(function*() {
+    const windowOptions = { ...DEFAULT_PUBLISH_WINDOW, ...options?.publishWindow }
     const log = yield* ReplicaLog
     const conversations = yield* ConversationRepo
     const entries = yield* EntryRepo
@@ -107,6 +172,17 @@ export const LiveHubLive: Layer.Layer<
     const activities = new Map<BotId, BotActivity>()
     const pubsub = yield* PubSub.unbounded<HubItem>()
     yield* Effect.addFinalizer(() => PubSub.shutdown(pubsub))
+    // The window's timers live in the layer's scope: they die with the layer (architecture §4.3-4).
+    const scope = yield* Effect.scope
+    /** One window state per conversation replica; the roster replica never uses the window. */
+    const windowStates = new Map<ReplicaKey, PublishWindowState>()
+    const windowState = (key: ReplicaKey): PublishWindowState => {
+      const existing = windowStates.get(key)
+      if (existing !== undefined) return existing
+      const created: PublishWindowState = { pending: new Map(), flushed: new Set(), timerScheduled: false }
+      windowStates.set(key, created)
+      return created
+    }
 
     // ------------------------------------------------------------------ heads (call under `lock`)
 
@@ -142,33 +218,48 @@ export const LiveHubLive: Layer.Layer<
         return epoch
       })
 
+    /** sequence++ → ReplicaLog → PubSub. The caller holds the lock. */
+    const appendUnlocked = (key: ReplicaKey, change: ReplicaChange): Effect.Effect<StreamCursor> =>
+      Effect.gen(function*() {
+        const current = yield* headUnlocked(key)
+        const cursor: StreamCursor = { epoch: current.epoch, sequence: current.sequence + 1 }
+        const record: ReplicaRecord = { replicaKey: key, epoch: cursor.epoch, sequence: cursor.sequence, change }
+        const appended = yield* log.append(record).pipe(
+          Effect.as(true),
+          Effect.catchCause((cause) =>
+            Effect.logError(`LiveHub: ReplicaLog.append failed for ${key}; rebuilding the replica`, cause).pipe(
+              Effect.as(false),
+            )
+          ),
+        )
+        if (!appended) {
+          // The change is committed in its repository; a new epoch makes every client re-snapshot.
+          const epoch = yield* resetUnlocked(key, "rebuild")
+          return { epoch, sequence: 0 }
+        }
+        heads.set(key, cursor)
+        yield* PubSub.publish(pubsub, { key, kind: "change", cursor, change })
+        return cursor
+      })
+
     /** sequence++ → ReplicaLog → PubSub, serialized so the bus order is the sequence order. */
     const append = (key: ReplicaKey, change: ReplicaChange): Effect.Effect<StreamCursor> =>
-      lock.withPermits(1)(
-        Effect.gen(function*() {
-          const current = yield* headUnlocked(key)
-          const cursor: StreamCursor = { epoch: current.epoch, sequence: current.sequence + 1 }
-          const record: ReplicaRecord = { replicaKey: key, epoch: cursor.epoch, sequence: cursor.sequence, change }
-          const appended = yield* log.append(record).pipe(
-            Effect.as(true),
-            Effect.catchCause((cause) =>
-              Effect.logError(`LiveHub: ReplicaLog.append failed for ${key}; rebuilding the replica`, cause).pipe(
-                Effect.as(false),
-              )
-            ),
-          )
-          if (!appended) {
-            // The change is committed in its repository; a new epoch makes every client re-snapshot.
-            const epoch = yield* resetUnlocked(key, "rebuild")
-            return { epoch, sequence: 0 }
-          }
-          heads.set(key, cursor)
-          yield* PubSub.publish(pubsub, { key, kind: "change", cursor, change })
-          return cursor
-        }),
-      )
+      lock.withPermits(1)(appendUnlocked(key, change))
 
     const publishRoster = (change: KnownRosterChange) => append(rosterReplicaKey, { replica: "roster", change })
+
+    /**
+     * Publishes two changes back to back under one lock, so nothing can be published between them.
+     * Used by the terminal path, which publishes the last buffered intermediate state and the
+     * terminal state as one indivisible pair (C-2).
+     */
+    const appendPair = (key: ReplicaKey, first: ReplicaChange, second: ReplicaChange): Effect.Effect<StreamCursor> =>
+      lock.withPermits(1)(
+        Effect.gen(function*() {
+          yield* appendUnlocked(key, first)
+          return yield* appendUnlocked(key, second)
+        }),
+      )
 
     // ------------------------------------------------------------------ snapshots
 
@@ -295,9 +386,148 @@ export const LiveHubLive: Layer.Layer<
         }),
       )
 
+    // ------------------------------------------------------------------ the publish window
+
+    /** Publishes one buffered change and clears the entry's buffer. */
+    const flushEntry = (key: ReplicaKey, state: PublishWindowState, entryId: EntryId): Effect.Effect<StreamCursor | undefined> =>
+      Effect.gen(function*() {
+        const buffered = state.pending.get(entryId)
+        if (buffered === undefined) return undefined
+        // Remove it first: a half-removed entry must never be published twice.
+        state.pending.delete(entryId)
+        state.flushed.add(entryId)
+        return yield* append(key, { replica: "conversation", change: buffered.latest })
+      })
+
+    /**
+     * The trailing timer: waits until the oldest buffered change is `stallMs` old, then publishes
+     * every entry whose buffer really has not moved since (a stalled stream) and re-arms itself
+     * for the ones that are still advancing.
+     *
+     * `timerScheduled` stays true for the timer's whole life (it is the "a timer is running" flag),
+     * so a re-arm never forks a second timer.
+     */
+    const runStallTimer = (key: ReplicaKey, state: PublishWindowState): Effect.Effect<void> =>
+      Effect.gen(function*() {
+        const oldest = [...state.pending.values()].reduce<number | undefined>(
+          (min, entry) => (min === undefined || entry.lastUpdatedAt < min ? entry.lastUpdatedAt : min),
+          undefined,
+        )
+        if (oldest === undefined) {
+          state.timerScheduled = false
+          return
+        }
+        const now = yield* Clock.currentTimeMillis
+        const wait = Math.max(0, oldest + windowOptions.stallMs - now)
+        yield* Effect.sleep(Duration.millis(wait))
+        const at = yield* Clock.currentTimeMillis
+        // Publish the entries that really stalled; keep the ones that are still advancing.
+        const stalled = [...state.pending.entries()].filter(([, entry]) => at - entry.lastUpdatedAt >= windowOptions.stallMs)
+        for (const [entryId] of stalled) {
+          const buffered = state.pending.get(entryId)
+          if (buffered === undefined) continue
+          state.pending.delete(entryId)
+          state.flushed.add(entryId)
+          yield* append(key, { replica: "conversation", change: buffered.latest })
+        }
+        if (state.pending.size === 0) {
+          state.timerScheduled = false
+          return
+        }
+        // Still something buffered: re-arm for the next stall deadline (the flag stays true).
+        yield* Effect.forkIn(runStallTimer(key, state), scope, { startImmediately: true })
+      })
+
+    /** Arms the trailing timer if it is not already running. */
+    const armStallTimer = (key: ReplicaKey, state: PublishWindowState): Effect.Effect<void> =>
+      Effect.gen(function*() {
+        if (state.timerScheduled) return
+        state.timerScheduled = true
+        yield* Effect.forkIn(runStallTimer(key, state), scope, { startImmediately: true })
+      })
+
+    /** Drops an entry's buffer (terminal upsert, `entry.removed`): nothing buffered survives it. */
+    const dropEntry = (state: PublishWindowState, entryId: EntryId) => {
+      state.pending.delete(entryId)
+    }
+
+    /**
+     * Publishes a change, routing it through the window when it is a still-growing upsert.
+     *
+     * Returns the change's own cursor when it was published, or `undefined` when the window
+     * buffered it.
+     */
+    const publishConversation = (
+      conversationId: ConversationId,
+      change: KnownConversationChange,
+    ): Effect.Effect<StreamCursor | undefined> => {
+      const key = conversationReplicaKey(conversationId)
+      if (!windowOptions.enabled) return append(key, { replica: "conversation", change })
+
+      // A streaming upsert is the only kind of change the window buffers.
+      const streaming = change.type === "entry.upserted" && isStreamingUpsert(change.entry)
+
+      if (!streaming) {
+        if (change.type === "entry.upserted") {
+          // A terminal upsert: resolve the entry's buffered intermediate states first (C-2).
+          const state = windowState(key)
+          const entryId = change.entry.id
+          const alreadyFlushed = state.flushed.has(entryId)
+          const buffered = state.pending.get(entryId)
+          dropEntry(state, entryId)
+          // The entry's streaming lifecycle is over: its "was flushed" fact is no longer needed.
+          state.flushed.delete(entryId)
+          if (alreadyFlushed) {
+            // The client has already seen intermediate states of this entry: drop the rest and
+            // publish the terminal one alone.
+            return append(key, { replica: "conversation", change })
+          }
+          if (buffered !== undefined) {
+            // The client has not seen any intermediate state yet: publish the last one first, so
+            // the stream still grows, then the terminal one. Both go out under one lock, so no
+            // other change can slip between them.
+            return appendPair(
+              key,
+              { replica: "conversation", change: buffered.latest },
+              { replica: "conversation", change },
+            )
+          }
+          return append(key, { replica: "conversation", change })
+        }
+        if (change.type === "entry.removed") {
+          // A removal drops the entry's buffered states: publishing them afterwards would
+          // resurrect the entry that was just deleted.
+          const state = windowState(key)
+          dropEntry(state, change.entryId)
+          state.flushed.delete(change.entryId)
+        }
+        return append(key, { replica: "conversation", change })
+      }
+
+      // A streaming upsert: buffer it.
+      const entryId = change.entry.id
+      return Effect.gen(function*() {
+        const state = windowState(key)
+        const now = yield* Clock.currentTimeMillis
+        const previous = state.pending.get(entryId)
+        const buffered: PendingEntry = {
+          latest: change,
+          count: (previous?.count ?? 0) + 1,
+          lastUpdatedAt: now,
+        }
+        state.pending.set(entryId, buffered)
+        if (buffered.count >= windowOptions.maxPending) {
+          // Count trigger: publish this entry now, leaving the other entries alone. The change
+          // was published, so the caller gets its cursor.
+          return yield* flushEntry(key, state, entryId)
+        }
+        yield* armStallTimer(key, state)
+        return undefined
+      })
+    }
+
     return LiveHub.of({
-      publishConversation: (conversationId, change: KnownConversationChange) =>
-        append(conversationReplicaKey(conversationId), { replica: "conversation", change }),
+      publishConversation,
 
       publishRoster,
 
@@ -325,7 +555,14 @@ export const LiveHubLive: Layer.Layer<
         }),
 
       resetConversation: (conversationId, reason) =>
-        lock.withPermits(1)(resetUnlocked(conversationReplicaKey(conversationId), reason)),
+        lock.withPermits(1)(
+          Effect.gen(function*() {
+            const key = conversationReplicaKey(conversationId)
+            // A new epoch invalidates the window's buffers: the old epoch's changes are gone.
+            windowStates.delete(key)
+            return yield* resetUnlocked(key, reason)
+          }),
+        ),
 
       activities: Effect.sync(() => [...activities.values()]),
 
@@ -336,16 +573,19 @@ export const LiveHubLive: Layer.Layer<
           yield* publishRoster({ type: "activity.updated", activity })
         }),
     })
-  }).pipe(
-    // Forward node list changes into the roster for the lifetime of the layer (D: §8.6).
-    Effect.tap((hub) =>
-      Effect.gen(function*() {
-        const directory = yield* NodeDirectory
-        yield* Effect.forkScoped(
-          Stream.runForEach(directory.changes, (change) => Effect.asVoid(hub.publishRoster(change))),
-          { startImmediately: true },
-        )
-      })
+    }).pipe(
+      // Forward node list changes into the roster for the lifetime of the layer (D: §8.6).
+      Effect.tap((hub) =>
+        Effect.gen(function*() {
+          const directory = yield* NodeDirectory
+          yield* Effect.forkScoped(
+            Stream.runForEach(directory.changes, (change) => Effect.asVoid(hub.publishRoster(change))),
+            { startImmediately: true },
+          )
+        })
+      ),
     ),
-  ),
-)
+  )
+
+/** The default LiveHub layer: the publish window on, with its default parameters (K=4, 2000 ms). */
+export const LiveHubLive = makeLiveHubLayer()

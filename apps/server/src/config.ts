@@ -17,6 +17,8 @@
  * | (env only) | `OPENBOT_SKILLS_SH_URL` | `https://skills.sh` (the skills catalog; tests point it at a fake) |
  * | (env only) | `OPENBOT_SLACK_API_URL` | `https://slack.com/api` (Slack's Web API; tests point it at a fake) |
  * | (env only) | `OPENBOT_HARK_URL` | `https://hark.ryan.ceo` (iPhone notifications; tests point it at a fake) |
+ * | (env only) | `OPENBOT_STREAM_WINDOW_MAX_PENDING` | `4` (LiveHub publish window: buffered streaming changes per entry; `1` = window off) |
+ * | (env only) | `OPENBOT_STREAM_WINDOW_STALL_MS` | `2000` (LiveHub publish window: stall fallback, ms) |
  */
 import { KnownHarnessKinds } from "@openbot/contracts"
 import { Context, Layer } from "effect"
@@ -58,6 +60,17 @@ export interface ServerConfigShape {
   readonly harkUrl?: string | undefined
   /** An unused bot desktop sleeps after this long, ms (0 = never); absent = 10 min. */
   readonly desktopIdleMs?: number | undefined
+  /**
+   * LiveHub publish window: how many buffered streaming changes one entry may accumulate before
+   * it is published (K). `1` disables the window (every change is published on its own) — the
+   * "unmerged control" path for the before/after comparison. Absent = 4.
+   */
+  readonly streamWindowMaxPending?: number | undefined
+  /**
+   * LiveHub publish window: the stall fallback, ms. An entry whose buffered change has not been
+   * updated for this long is published (keep-alive). Absent = 2000.
+   */
+  readonly streamWindowStallMs?: number | undefined
 }
 
 export class ServerConfig extends Context.Service<ServerConfig, ServerConfigShape>()("openbot/server/ServerConfig") {
@@ -305,6 +318,28 @@ export const parseCommand = (
     harkUrl = harkInput.replace(/\/+$/, "")
   }
 
+  // The LiveHub publish window (env only; no CLI flag). `OPENBOT_STREAM_WINDOW_MAX_PENDING=1`
+  // turns the window off — the "unmerged control" path for the before/after comparison.
+  const maxPendingInput = env["OPENBOT_STREAM_WINDOW_MAX_PENDING"]?.trim()
+  let streamWindowMaxPending: number | undefined
+  if (maxPendingInput !== undefined && maxPendingInput !== "") {
+    const parsed = Number(maxPendingInput)
+    if (!Number.isInteger(parsed) || parsed < 1 || parsed > 5) {
+      throw new ConfigError(`OPENBOT_STREAM_WINDOW_MAX_PENDING: "${maxPendingInput}" is not an integer in 1..5`)
+    }
+    streamWindowMaxPending = parsed
+  }
+
+  const stallInput = env["OPENBOT_STREAM_WINDOW_STALL_MS"]?.trim()
+  let streamWindowStallMs: number | undefined
+  if (stallInput !== undefined && stallInput !== "") {
+    const parsed = Number(stallInput)
+    if (!Number.isInteger(parsed) || parsed < 1_000 || parsed > 5_000) {
+      throw new ConfigError(`OPENBOT_STREAM_WINDOW_STALL_MS: "${stallInput}" is not an integer in 1000..5000`)
+    }
+    streamWindowStallMs = parsed
+  }
+
   return {
     _tag: "Run",
     config: {
@@ -321,6 +356,8 @@ export const parseCommand = (
       ...(skillsShUrl === undefined ? {} : { skillsShUrl }),
       ...(slackApiUrl === undefined ? {} : { slackApiUrl }),
       ...(harkUrl === undefined ? {} : { harkUrl }),
+      ...(streamWindowMaxPending === undefined ? {} : { streamWindowMaxPending }),
+      ...(streamWindowStallMs === undefined ? {} : { streamWindowStallMs }),
     },
   }
 }

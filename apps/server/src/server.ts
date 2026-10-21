@@ -53,8 +53,8 @@ import {
   HarnessRegistry,
   IdGen,
   InstructionRendererLive,
-  LiveHubLive,
   makeDataDir,
+  makeLiveHubLayer,
   MAX_SENT_FILES,
   MemoryServiceLive,
   MessagingLive,
@@ -349,6 +349,18 @@ export const ServerLive = (config: ServerConfigShape, options?: ServerOptions) =
     ? Layer.empty
     : Layer.succeed(SendFileLimits, { maxFileBytes: config.maxFileBytes, maxFiles: MAX_SENT_FILES })
   const base = Layer.mergeAll(ServerConfig.layer(config), DataDir.layer(config.dataDir), IdGen.layer, limits)
+  // The LiveHub publish window: buffered streaming changes (K per entry) + the stall fallback.
+  // `OPENBOT_STREAM_WINDOW_MAX_PENDING=1` turns it off — the "unmerged control" path.
+  // Unset options keep core's defaults (K=4, stall 2000 ms).
+  const maxPending = config.streamWindowMaxPending
+  const stallMs = config.streamWindowStallMs
+  const liveHub = makeLiveHubLayer({
+    publishWindow: {
+      enabled: maxPending === undefined ? true : maxPending > 1,
+      ...(maxPending === undefined ? {} : { maxPending }),
+      ...(stallMs === undefined ? {} : { stallMs }),
+    },
+  })
   const listeners = Layer.mergeAll(PublicListenerLive, InternalListenerLive)
   // HostPathsLive: the local computer's home and git repo roots (project folders, "Allow in ‹folder›").
   const ports = Layer.mergeAll(
@@ -398,7 +410,7 @@ export const ServerLive = (config: ServerConfigShape, options?: ServerOptions) =
     Layer.provideMerge(HarkLive({ file: makeDataDir(config.dataDir).hark, baseUrl: config.harkUrl })), // iPhone notifications (D3.5)
     Layer.provideMerge(MemoryServiceLive),
     Layer.provideMerge(level2),
-    Layer.provideMerge(LiveHubLive),
+    Layer.provideMerge(liveHub),
     Layer.provideMerge(foundation),
   )
   // steps 11-14: gateways, both listeners' routes, ready. The two `HttpRouter.serve` layers are

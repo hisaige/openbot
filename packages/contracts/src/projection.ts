@@ -37,7 +37,11 @@ export const compareEntries = (a: { readonly createdAt: number; readonly id: str
 /** Upsert rule shared by server and client: an older revision never replaces a newer one. */
 export const shouldReplaceEntry = (prev: TranscriptEntry | undefined, next: TranscriptEntry): boolean => !prev || prev.revision <= next.revision
 
-const isStreamingUpsert = (entry: TranscriptEntry): boolean =>
+/**
+ * Is this upsert a still-growing intermediate state? Shared by the contract layer's `coalesce()`
+ * and the server's LiveHub publish window, so the two never drift on what counts as "streaming".
+ */
+export const isStreamingUpsert = (entry: TranscriptEntry): boolean =>
   ((entry.kind === "message" || entry.kind === "reasoning") && entry.streaming) ||
   (entry.kind === "tool-call" && (entry.status === "pending" || entry.status === "running"))
 

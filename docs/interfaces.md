@@ -411,7 +411,7 @@ PendingRequestReceipt { status: "pending"; requestId }
 The error channel is shown after `!`. Methods with no `!` never fail.
 
 ```ts
-LiveHub              publishConversation(convId, KnownConversationChange): StreamCursor     // call AFTER commit
+LiveHub              publishConversation(convId, KnownConversationChange): StreamCursor|undefined   // call AFTER commit
                      publishRoster(KnownRosterChange): StreamCursor
                      subscribeConversation({conversationId, after?, tailLimit?}): Stream<KnownConversationStreamItem> ! NotFound
                      subscribeRoster({after?}): Stream<KnownRosterStreamItem>
@@ -482,6 +482,26 @@ SettingsService      get: Settings; update(SettingsPatch): Settings ! InvalidInp
 UsageService         record({botId, conversationId, turnId?, harness, model?, usage}); byBot({sinceMs?}): BotUsage[]
 AttachmentService    upload({name, mime, bytes}): Attachment ! InvalidInput; get(id): Attachment ! NotFound
 ```
+
+**The LiveHub publish window.** `publishConversation` buffers the still-growing
+(`isStreamingUpsert`) `entry.upserted` changes of an entry instead of publishing each one, so a
+streaming turn reaches the client in batches. A buffered change is **not** published and gets **no
+sequence** — `publishConversation` returns `undefined` for it; every other change is published at
+once and returns its cursor.
+
+| What ends a buffer | Rule |
+|---|---|
+| **Count trigger** | the entry accumulated `maxPending` buffered changes → the newest one is published |
+| **Stall fallback** | the entry's buffer has not been updated for `stallMs` → the newest one is published (keep-alive) |
+| **Terminal upsert** | never waits: the terminal change is published immediately. If the entry had **not** been flushed yet, the last buffered state is published just before it; if it **had**, the pending states are dropped |
+| **`entry.removed`** | the entry's buffered states are dropped — publishing them afterwards would resurrect the removed entry |
+
+There is deliberately **no time-based tick**: a "flush everything every W ms" window degenerates
+into one change per token on any harness whose token interval exceeds W, and the change count
+stops shrinking. The window is off with `enabled: false`; `apps/server` wires it from
+`OPENBOT_STREAM_WINDOW_MAX_PENDING` (`1` = off — the unmerged control path) and
+`OPENBOT_STREAM_WINDOW_STALL_MS`. `LiveHubFake` does **not** implement the window, so it records
+more changes than production does — a test that counts merged changes must use `LiveHubLive`.
 
 Gateway bot tools map onto these methods:
 

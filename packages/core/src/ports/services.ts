@@ -264,11 +264,26 @@ export class LiveHub extends Context.Service<LiveHub, {
   /**
    * Appends a change to the conversation replica (`sequence++`, ReplicaLog, ring buffer of 256) and
    * publishes it. Call AFTER the change is committed to its repository.
+   *
+   * With the publish window enabled, a still-growing (`isStreamingUpsert`) `entry.upserted` is
+   * **buffered** instead of published: the call returns `undefined` and the change is published
+   * later — either when its entry reaches `maxPending` buffered changes (count trigger) or when the
+   * stream stalls (`stallMs`), whichever comes first. Every other change (terminal upserts,
+   * `entry.removed`, `turn.upserted`, `request.upserted`, `conversation.updated`) is published
+   * immediately and returns its cursor.
+   *
+   * A terminal upsert also resolves its entry's buffered intermediate states first: if the entry
+   * had already been flushed at least once, the buffered states are dropped and only the terminal
+   * one is published; if it never had, the last buffered state is published first so the client
+   * still observes at least one intermediate update. A terminal is **never** delayed by the window.
+   *
+   * The window never allocates a sequence for a change it did not publish, so the sequence stays
+   * gapless and a client that resumes with `after: cursor` still replays a consistent history.
    */
   readonly publishConversation: (
     conversationId: ConversationId,
     change: KnownConversationChange,
-  ) => Effect.Effect<StreamCursor>
+  ) => Effect.Effect<StreamCursor | undefined>
   /** Same for the roster replica. */
   readonly publishRoster: (change: KnownRosterChange) => Effect.Effect<StreamCursor>
   /**
