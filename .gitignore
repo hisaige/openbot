@@ -42,3 +42,6 @@ docs/research/
 apps/web/test/screenshots/
 apps/web/test/e2e/screenshots/
 packages/ui/test/screenshots/
+
+# the diagnostics' measurement output (written by apps/web/test/e2e/scroll-perf.test.ts)
+apps/web/test/e2e/scroll-perf-results.json
