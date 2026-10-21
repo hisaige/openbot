@@ -204,8 +204,12 @@ describe.skipIf(!hasChromium)("e2e: chat scroll performance", () => {
   // ------------------------------------------------------------------- E-4 (US-6) — after arm
 
   test("E-4 (after): the parse counts during a streaming turn", async () => {
+    // A FRESH RPC connection: the one from `beforeAll` has been idle through the (slow) scroll
+    // measurements, and the server drops a silent socket — the call then fails with a ping timeout
+    // that has nothing to do with what this test measures.
+    const streamRpc = await connectRpc(brain as never)
     // A fresh bot in a fresh conversation, so the turn has a clean body set.
-    const streamBot = await rpc.call((c) =>
+    const streamBot = await streamRpc.call((c) =>
       c["bots.create"]({ name: "Stream", harness: { kind: "fake" }, clientNonce: "scroll-perf-stream", introduce: false }),
     )
     // Load the conversation (which parses every message once) and reset the counters.
@@ -219,6 +223,10 @@ describe.skipIf(!hasChromium)("e2e: chat scroll performance", () => {
     const words = Array.from({ length: 30 }, (_, i) => `w${i}`).join(" ")
     await page.getByRole("textbox", { name: "Message Stream" }).fill(`echo: ${words}`)
     await page.getByRole("textbox", { name: "Message Stream" }).press("Enter")
+    // Wait for the reply to be ON SCREEN first: `waitIdle` waits for the Stop button to be
+    // detached, and right after the send the turn has not started yet — the button is not there at
+    // all, so `waitIdle` returns immediately and the measurement catches half a turn.
+    await page.getByTestId("transcript").getByText(`w${29}`, { exact: false }).waitFor({ timeout: 60_000 })
     await waitIdle(page, 30_000)
     await Bun.sleep(500)
 
@@ -237,6 +245,7 @@ describe.skipIf(!hasChromium)("e2e: chat scroll performance", () => {
     expect(stats.changedBodies).toBeLessThanOrEqual(2)
     // The stronger criterion the architecture pins: an UNCHANGED body is not re-parsed at all.
     expect(stats.unchangedBodies).toBe(0)
+    await streamRpc.close()
   }, 180_000)
 
   test("the results file is written", () => {

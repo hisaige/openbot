@@ -13,7 +13,6 @@
 // The counter itself is INSTRUMENTATION, not the optimization: it stays in both arms, so the only
 // difference between them is the memo wrapper and the `bots` reference stabilization.
 
-import { chromium } from "playwright-core"
 import type { Browser } from "playwright-core"
 import { connectRpc, launchBrowser, startBrain, waitIdle } from "./brain.ts"
 import { CLIENT_CHANGE_SCRIPT, PARSE_STATS_INIT_SCRIPT } from "./client-changes.ts"
@@ -89,7 +88,7 @@ export const measureStreamingTurn = async (
 
     const stats = await page.evaluate(() => (window as any).__obMarkdownParseStats())
     const changes = await page.evaluate(() => (window as any).__obClientChanges.read())
-    const finalText = Object.values(changes.lastTextByEntry).at(-1) ?? ""
+    const finalText = String(Object.values(changes.lastTextByEntry).at(-1) ?? "")
     await context.close()
     await rpc.close()
     return {

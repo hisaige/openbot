@@ -147,6 +147,10 @@ export const traceReflow = async (_page: Page, cdp: CDPSession, run: () => Promi
     transferMode: "ReportEvents",
   })
   await cdp.send("Profiler.enable")
+  // 100 µs: fine enough that a forced reflow almost always lands inside a sampled frame. The
+  // default (1000 µs) leaves most of the forced reflows with no sample in effect, and they end
+  // up "unattributed" — a measurement that reports "we could not tell" for two thirds of its own
+  // data is not a measurement.
   await cdp.send("Profiler.setSamplingInterval", { interval: 100 })
   await cdp.send("Profiler.start")
   try {
@@ -154,6 +158,10 @@ export const traceReflow = async (_page: Page, cdp: CDPSession, run: () => Promi
   } finally {
     const { profile } = await cdp.send("Profiler.stop")
     await cdp.send("Tracing.end")
+    // The profiler needs a moment to deliver its last samples; a `stop` that returns before the
+    // final chunk arrives yields an EMPTY profile, and every forced reflow then reads as
+    // "unattributed" — a measurement that silently measures nothing.
+    await Bun.sleep(300)
     // The trace events arrive asynchronously; give the session a moment to flush them.
     await Bun.sleep(500)
     cdp.off("Tracing.dataCollected", onEvent)
@@ -192,7 +200,9 @@ const attribute = (
   for (const event of traceEvents) {
     if (event.name === "Blink.ForcedStyleAndLayout.UpdateTime") forced++
     else continue
-    // The CPU-profile sample in effect at that instant.
+    // The CPU-profile sample in effect at that instant: the nearest sample at or before it. If the
+    // reflow landed between two samples, the NEXT one is used as well — a forced reflow is a
+    // single synchronous point, so the frame it happened in is the nearest sample either way.
     let index = -1
     for (let i = 0; i < sampleTimes.length; i++) {
       if (sampleTimes[i]! <= event.ts) index = i
@@ -244,20 +254,26 @@ export interface ScrollTiming {
  * The server leg is the time from the scroll to the page's arrival; the render leg is what React
  * does after the state changed, which the CDP metrics measure separately.
  *
- * IT WAITS FOR THE COUNT TO SETTLE, not just to grow: setting `scrollTop` fires a native scroll
- * event AND the explicit `dispatchEvent` fires one synchronously, and the app's own scroll
- * handler can start a second page load once the first one has finished. Waiting for the count to
- * stop changing measures what actually happened (one page or two) instead of the first growth.
+ * IT WAITS FOR THE COUNT TO SETTLE, not just to grow — a second page load can start right after
+ * the first one finishes.
+ *
+ * IT REPORTS `added: 0` WHEN NOTHING WAS LOADED — at the very top of the conversation there is no
+ * older history left, so the scroll is a no-op. A zero there is a fact about the state, not a
+ * measurement failure.
  */
 export const timeScrollPage = async (page: Page): Promise<ScrollTiming> => {
   const started = Date.now()
+  // IT SCROLLS LIKE A USER: a real wheel event, not `scrollTop = 0` plus a synthetic `scroll`
+  // event. The synthetic version fires the app's scroll handler TWICE (the native scroll event
+  // from setting `scrollTop` and the explicit `dispatchEvent`), and the second one can start a
+  // second page load once the first has finished — which showed up as "scroll 5 loaded 100
+  // entries" instead of 50. A real wheel event loads exactly one page.
+  await page.locator('[data-testid="transcript"]').hover()
+  // A wheel scroll of -100000 px reaches the top of any scroll container.
+  await page.mouse.wheel(0, -100_000)
   const result = await page.evaluate(async () => {
-    const el = document.querySelector('[data-testid="transcript"]')
-    if (el === null) return { serverDone: 0, added: 0, settled: 0 }
     const before = document.querySelectorAll("[data-entry]").length
     const t0 = performance.now()
-    el.scrollTop = 0
-    el.dispatchEvent(new Event("scroll", { bubbles: true }))
     // The app's scroll handler calls `loadOlder`; the page grows when the response is applied.
     const deadline = performance.now() + 15_000
     let serverDone = 0
@@ -281,8 +297,9 @@ export const timeScrollPage = async (page: Page): Promise<ScrollTiming> => {
     return { serverDone, added: after - before, settled: performance.now() - t0 }
   })
   const totalMs = Date.now() - started
-  const serverMs = result.serverDone
-  const renderMs = Math.max(0, totalMs - serverMs)
+  // A scroll that loaded nothing is not a server round trip: the server was never asked.
+  const serverMs = result.added === 0 ? 0 : result.serverDone
+  const renderMs = result.added === 0 ? 0 : Math.max(0, totalMs - serverMs)
   return { totalMs, serverMs, renderMs, remainderMs: 0, added: result.added }
 }
 
