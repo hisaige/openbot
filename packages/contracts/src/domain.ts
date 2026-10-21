@@ -201,7 +201,7 @@ export const Conversation = Schema.Union([DirectConversation, GroupConversation,
 export type Conversation = typeof Conversation.Type
 
 export const MIN_GROUP_BOTS = 2
-export const MAX_GROUP_BOTS = 6
+export const MAX_GROUP_BOTS = 15
 
 /** Sidebar row (denormalized; t3code ThreadShell / Grok roster row). */
 export const ConversationSummary = Schema.Struct({
