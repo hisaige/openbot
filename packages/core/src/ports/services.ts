@@ -279,6 +279,10 @@ export class LiveHub extends Context.Service<LiveHub, {
    *
    * The window never allocates a sequence for a change it did not publish, so the sequence stays
    * gapless and a client that resumes with `after: cursor` still replays a consistent history.
+   *
+   * A new epoch (a reset, or the rebuild that follows a failed `ReplicaLog.append`) invalidates
+   * the window's state: the old epoch's buffered changes are dropped instead of being published
+   * into the new epoch, and the "was this entry already flushed" memory starts empty again.
    */
   readonly publishConversation: (
     conversationId: ConversationId,

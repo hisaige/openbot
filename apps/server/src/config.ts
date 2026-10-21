@@ -17,7 +17,7 @@
  * | (env only) | `OPENBOT_SKILLS_SH_URL` | `https://skills.sh` (the skills catalog; tests point it at a fake) |
  * | (env only) | `OPENBOT_SLACK_API_URL` | `https://slack.com/api` (Slack's Web API; tests point it at a fake) |
  * | (env only) | `OPENBOT_HARK_URL` | `https://hark.ryan.ceo` (iPhone notifications; tests point it at a fake) |
- * | (env only) | `OPENBOT_STREAM_WINDOW_MAX_PENDING` | `4` (LiveHub publish window: buffered streaming changes per entry; `1` = window off) |
+ * | (env only) | `OPENBOT_STREAM_WINDOW_MAX_PENDING` | `4` (LiveHub publish window: buffered streaming changes per entry; `1` = window off, otherwise 4..5) |
  * | (env only) | `OPENBOT_STREAM_WINDOW_STALL_MS` | `2000` (LiveHub publish window: stall fallback, ms) |
  */
 import { KnownHarnessKinds } from "@openbot/contracts"
@@ -63,7 +63,10 @@ export interface ServerConfigShape {
   /**
    * LiveHub publish window: how many buffered streaming changes one entry may accumulate before
    * it is published (K). `1` disables the window (every change is published on its own) — the
-   * "unmerged control" path for the before/after comparison. Absent = 4.
+   * "unmerged control" path for the before/after comparison. Otherwise K must be 4..5: the
+   * product spec v2 §2.8 C-3 tightened the allowed range to 4..5 (K=3 breaks the US-7 clause 2
+   * criterion `A <= floor((N+1)/3)` from N=21 on, and K=2 breaks it even earlier), so a value
+   * outside 4..5 would let a tuning run silently invalidate the criterion. Absent = 4.
    */
   readonly streamWindowMaxPending?: number | undefined
   /**
@@ -320,12 +323,22 @@ export const parseCommand = (
 
   // The LiveHub publish window (env only; no CLI flag). `OPENBOT_STREAM_WINDOW_MAX_PENDING=1`
   // turns the window off — the "unmerged control" path for the before/after comparison.
+  //
+  // Two ranges, checked separately: `1` switches the window off, and a window that is actually
+  // on must use K = 4..5. The product spec v2 §2.8 C-3 tightened the allowed range to 4~5
+  // (K=3 breaks the US-7 clause 2 criterion `A <= floor((N+1)/3)` from N=21 on; K=2 breaks it
+  // even earlier), so accepting 2 or 3 would let a tuning run silently invalidate the criterion
+  // while every test still passes — they only ever exercise K=4.
   const maxPendingInput = env["OPENBOT_STREAM_WINDOW_MAX_PENDING"]?.trim()
   let streamWindowMaxPending: number | undefined
   if (maxPendingInput !== undefined && maxPendingInput !== "") {
     const parsed = Number(maxPendingInput)
-    if (!Number.isInteger(parsed) || parsed < 1 || parsed > 5) {
-      throw new ConfigError(`OPENBOT_STREAM_WINDOW_MAX_PENDING: "${maxPendingInput}" is not an integer in 1..5`)
+    const windowOff = parsed === 1
+    const validK = parsed >= 4 && parsed <= 5
+    if (!Number.isInteger(parsed) || (!windowOff && !validK)) {
+      throw new ConfigError(
+        `OPENBOT_STREAM_WINDOW_MAX_PENDING: "${maxPendingInput}" must be 1 (the window off — the unmerged control path) or 4..5`,
+      )
     }
     streamWindowMaxPending = parsed
   }

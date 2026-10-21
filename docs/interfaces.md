@@ -499,9 +499,28 @@ once and returns its cursor.
 There is deliberately **no time-based tick**: a "flush everything every W ms" window degenerates
 into one change per token on any harness whose token interval exceeds W, and the change count
 stops shrinking. The window is off with `enabled: false`; `apps/server` wires it from
-`OPENBOT_STREAM_WINDOW_MAX_PENDING` (`1` = off — the unmerged control path) and
-`OPENBOT_STREAM_WINDOW_STALL_MS`. `LiveHubFake` does **not** implement the window, so it records
-more changes than production does — a test that counts merged changes must use `LiveHubLive`.
+`OPENBOT_STREAM_WINDOW_MAX_PENDING` and `OPENBOT_STREAM_WINDOW_STALL_MS`. `LiveHubFake` does
+**not** implement the window, so it records more changes than production does — a test that
+counts merged changes must use `LiveHubLive`.
+
+`OPENBOT_STREAM_WINDOW_MAX_PENDING` is the window's K. It takes **two** values, not one range:
+
+| Value | Meaning |
+|---|---|
+| `1` | the window is **off** — every change is published on its own (the unmerged control path E-5 compares against) |
+| `4` … `5` | the window is on, with that K |
+
+**Nothing in between is accepted** (a config error is raised at startup). The reason is a
+criterion, not a style rule: the US-7 clause 2 budget is `A ≤ floor((N+1)/3)`, where `A` is the
+number of changes the client applied. At K=3 that budget is broken from N=21 on (and K=2 breaks
+it earlier), so a K outside 4..5 would let a tuning run silently invalidate the criterion while
+every test still passes — the tests only ever exercise K=4. The product spec v2 §2.8 C-3 is the
+authority for this range.
+
+A **new epoch** invalidates the window's state: the old epoch's buffered changes are dropped
+rather than published into the new epoch, and the "was this entry already flushed" memory (which
+decides the terminal-upsert branch) starts empty in the new epoch. Both the reset path and the
+rebuild path (`ReplicaLog.append` failed) go through the same invalidation.
 
 Gateway bot tools map onto these methods:
 

@@ -93,6 +93,35 @@ describe("parseCommand", () => {
     expect(() => run([], { OPENBOT_SKILLS_SH_URL: "skills.example" })).toThrow("not an http(s) URL")
   })
 
+  /**
+   * The publish window's K (product spec v2 §2.8 C-3). `1` switches the window off — the
+   * "unmerged control" path E-5 depends on — and a window that is on must use K = 4..5.
+   *
+   * The rejected values are not arbitrary: K=2 and K=3 break the US-7 clause 2 criterion
+   * `A <= floor((N+1)/3)` (K=3 from N=21 on, K=2 earlier), so accepting them would let a tuning
+   * run silently invalidate the criterion while every test still passes — they only ever
+   * exercise K=4. This test is the only thing standing between a typo and a broken criterion.
+   */
+  test("the publish window's K: 1 (off) or 4..5 — nothing in between", () => {
+    // The window off: the unmerged control path (E-5).
+    expect(run([], { OPENBOT_STREAM_WINDOW_MAX_PENDING: "1" }).streamWindowMaxPending).toBe(1)
+    // The allowed window values.
+    expect(run([], { OPENBOT_STREAM_WINDOW_MAX_PENDING: "4" }).streamWindowMaxPending).toBe(4)
+    expect(run([], { OPENBOT_STREAM_WINDOW_MAX_PENDING: "5" }).streamWindowMaxPending).toBe(5)
+    // Absent = the default (K=4).
+    expect(run([], {}).streamWindowMaxPending).toBeUndefined()
+    // The values that break the criterion, and everything else outside 1 / 4..5.
+    for (const bad of ["2", "3", "0", "6", "-1", "1.5", "abc", "NaN", "1e9"]) {
+      expect(() => run([], { OPENBOT_STREAM_WINDOW_MAX_PENDING: bad })).toThrow(ConfigError)
+    }
+    // The stall fallback keeps its own range.
+    expect(run([], { OPENBOT_STREAM_WINDOW_STALL_MS: "1000" }).streamWindowStallMs).toBe(1000)
+    expect(run([], { OPENBOT_STREAM_WINDOW_STALL_MS: "5000" }).streamWindowStallMs).toBe(5000)
+    for (const bad of ["999", "5001", "0", "abc"]) {
+      expect(() => run([], { OPENBOT_STREAM_WINDOW_STALL_MS: bad })).toThrow(ConfigError)
+    }
+  })
+
   test("help, version and errors", () => {
     expect(parseCommand(["--help"], {}, system)._tag).toBe("Help")
     expect(parseCommand(["-v"], {}, system)._tag).toBe("Version")

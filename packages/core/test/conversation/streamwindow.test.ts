@@ -332,6 +332,88 @@ describe("the publish window: the invariants", () => {
   })
 })
 
+describe("the publish window: a new epoch invalidates the old buffers", () => {
+  /**
+   * A new epoch (a reset, or the rebuild that follows a failed `ReplicaLog.append`) makes every
+   * buffered change of the old epoch meaningless. The old epoch's buffer must not be published
+   * into the new one: a change that never got a sequence in the old epoch must not suddenly get
+   * one in the new epoch (architecture §3.2.1 C-6), and the client must not receive a change
+   * that belongs to a conversation state it has already re-snapshotted.
+   *
+   * The control arm matters: without it, "nothing was published" could just mean "the timer
+   * never fired" and the test would pass for the wrong reason.
+   */
+  const runWithReset = (withReset: boolean) =>
+    runTest(
+      Effect.gen(function*() {
+        yield* seedConversation(CONV)
+        const hub = yield* LiveHub
+        const live = yield* collect(hub.subscribeConversation({ conversationId: CONV }))
+        const entry = entryId("ent_a")
+        // One buffered state, below the count trigger: it waits for the stall deadline.
+        yield* hub.publishConversation(CONV, upsert(streaming(entry, "old-text")))
+        yield* waitForChanges(live.items, 0)
+        if (withReset) yield* hub.resetConversation(CONV, "new-session")
+        // Let the stall deadline pass: the timer for the old buffer fires.
+        yield* TestClock.adjust("3 seconds")
+        yield* Effect.yieldNow
+        yield* Effect.yieldNow
+        return { items: yield* live.items }
+      }),
+      layer(),
+    )
+
+  test("the old epoch's buffered change is not published into the new epoch", async () => {
+    const out = await runWithReset(true)
+    // The client saw the reset, but no change carrying the old epoch's text.
+    const texts = upsertTexts(out.items)
+    expect(texts).not.toContain("old-text")
+  })
+
+  test("without a reset the same buffer IS published (the control arm)", async () => {
+    const out = await runWithReset(false)
+    // So the assertion above is about the epoch change, not about the timer being dead.
+    expect(upsertTexts(out.items)).toEqual(["old-text"])
+  })
+
+  test("a new epoch clears the 'was flushed' memory (C-2's predicate is per epoch)", async () => {
+    const out = await runTest(
+      Effect.gen(function*() {
+        yield* seedConversation(CONV)
+        const hub = yield* LiveHub
+        const live = yield* collect(hub.subscribeConversation({ conversationId: CONV }))
+        const entry = entryId("ent_a")
+        // 4 intermediate states: the count trigger fires, so the entry WAS flushed — the client
+        // has seen an intermediate state of it.
+        for (let i = 0; i < 4; i++) {
+          yield* hub.publishConversation(CONV, upsert(streaming(entry, `t${i}`, i)))
+        }
+        yield* waitForChanges(live.items, 1)
+        const afterFlush = yield* live.items
+        // A new epoch: the client's state is replaced by a fresh snapshot.
+        yield* hub.resetConversation(CONV, "new-session")
+        // The reset itself adds no change (it replaces the snapshot + synchronized).
+        yield* Effect.yieldNow
+        yield* Effect.yieldNow
+        // In the new epoch the same entry id streams again and ends with a terminal upsert.
+        // The new epoch's "was flushed" memory must be empty, so the terminal must re-send the
+        // last intermediate state — the client sees the stream grow again.
+        yield* hub.publishConversation(CONV, upsert(streaming(entry, "new-0", 0)))
+        yield* hub.publishConversation(CONV, upsert(terminal(entry, "new-done", 1)))
+        yield* waitForChanges(live.items, 3)
+        return { afterFlush, items: yield* live.items }
+      }),
+      layer(),
+    )
+    // The client saw the flushed intermediate state in the old epoch...
+    expect(upsertTexts(out.afterFlush)).toEqual(["t3"])
+    // ...and in the new epoch the terminal re-sent the last intermediate state (C-2's "never
+    // flushed" branch). If the old epoch's memory had survived, that state would have been
+    // dropped instead and the client would only see the terminal one.
+    expect(upsertTexts(out.items)).toEqual(["t3", "new-0", "new-done"])
+  })
+})
+
 describe("the publish window: the change-count budget (A-4, C-1/C-3)", () => {
   /**
    * The number of `entry.upserted` changes the **client** applied for one entry's streaming

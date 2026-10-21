@@ -213,6 +213,14 @@ export const makeLiveHubLayer = (
         yield* log.reset(key, epoch).pipe(
           Effect.catchCause((cause) => Effect.logError("LiveHub: ReplicaLog.reset failed", cause)),
         )
+        // A new epoch invalidates the window's buffers: the old epoch's changes are gone, and so
+        // is the "was this entry flushed" memory (C-2's predicate must not read the old epoch's
+        // answer). The state object is **replaced**, not merely emptied, so that a timer or a
+        // publish still holding the old one can tell that it is stale.
+        //
+        // This happens **before** the new head is published, so there is no window in which a
+        // stale buffer could be appended into the new epoch.
+        windowStates.delete(key)
         heads.set(key, { epoch, sequence: 0 })
         yield* PubSub.publish(pubsub, { key, kind: "reset", epoch, reason })
         return epoch
@@ -247,19 +255,6 @@ export const makeLiveHubLayer = (
       lock.withPermits(1)(appendUnlocked(key, change))
 
     const publishRoster = (change: KnownRosterChange) => append(rosterReplicaKey, { replica: "roster", change })
-
-    /**
-     * Publishes two changes back to back under one lock, so nothing can be published between them.
-     * Used by the terminal path, which publishes the last buffered intermediate state and the
-     * terminal state as one indivisible pair (C-2).
-     */
-    const appendPair = (key: ReplicaKey, first: ReplicaChange, second: ReplicaChange): Effect.Effect<StreamCursor> =>
-      lock.withPermits(1)(
-        Effect.gen(function*() {
-          yield* appendUnlocked(key, first)
-          return yield* appendUnlocked(key, second)
-        }),
-      )
 
     // ------------------------------------------------------------------ snapshots
 
@@ -388,16 +383,31 @@ export const makeLiveHubLayer = (
 
     // ------------------------------------------------------------------ the publish window
 
-    /** Publishes one buffered change and clears the entry's buffer. */
+    /**
+     * Is this window state still the live one for its replica? A new epoch replaces the state
+     * object, so a state that is no longer registered belongs to a dead epoch: its buffers must
+     * not be published, and its "was flushed" memory must not be read.
+     */
+    const isCurrentWindow = (key: ReplicaKey, state: PublishWindowState): boolean => windowStates.get(key) === state
+
+    /**
+     * Publishes one buffered change and clears the entry's buffer.
+     *
+     * The staleness check and the publish happen under the same lock, so a reset cannot slip
+     * between them: the old epoch's buffer can never be appended into the new epoch.
+     */
     const flushEntry = (key: ReplicaKey, state: PublishWindowState, entryId: EntryId): Effect.Effect<StreamCursor | undefined> =>
-      Effect.gen(function*() {
-        const buffered = state.pending.get(entryId)
-        if (buffered === undefined) return undefined
-        // Remove it first: a half-removed entry must never be published twice.
-        state.pending.delete(entryId)
-        state.flushed.add(entryId)
-        return yield* append(key, { replica: "conversation", change: buffered.latest })
-      })
+      lock.withPermits(1)(
+        Effect.gen(function*() {
+          if (!isCurrentWindow(key, state)) return undefined
+          const buffered = state.pending.get(entryId)
+          if (buffered === undefined) return undefined
+          // Remove it first: a half-removed entry must never be published twice.
+          state.pending.delete(entryId)
+          state.flushed.add(entryId)
+          return yield* appendUnlocked(key, { replica: "conversation", change: buffered.latest })
+        }),
+      )
 
     /**
      * The trailing timer: waits until the oldest buffered change is `stallMs` old, then publishes
@@ -406,6 +416,11 @@ export const makeLiveHubLayer = (
      *
      * `timerScheduled` stays true for the timer's whole life (it is the "a timer is running" flag),
      * so a re-arm never forks a second timer.
+     *
+     * The timer holds the state object it was armed for. A new epoch **replaces** that object
+     * (see `resetUnlocked`), so a timer whose state is no longer the current one belongs to a
+     * dead epoch: it must publish nothing and must not re-arm. Without this check the old
+     * epoch's buffered change was published into the new epoch.
      */
     const runStallTimer = (key: ReplicaKey, state: PublishWindowState): Effect.Effect<void> =>
       Effect.gen(function*() {
@@ -422,14 +437,24 @@ export const makeLiveHubLayer = (
         yield* Effect.sleep(Duration.millis(wait))
         const at = yield* Clock.currentTimeMillis
         // Publish the entries that really stalled; keep the ones that are still advancing.
-        const stalled = [...state.pending.entries()].filter(([, entry]) => at - entry.lastUpdatedAt >= windowOptions.stallMs)
-        for (const [entryId] of stalled) {
-          const buffered = state.pending.get(entryId)
-          if (buffered === undefined) continue
-          state.pending.delete(entryId)
-          state.flushed.add(entryId)
-          yield* append(key, { replica: "conversation", change: buffered.latest })
-        }
+        // The staleness check and the publish happen under one lock, so a reset cannot slip
+        // between them: the old epoch's buffer never reaches the new epoch.
+        yield* lock.withPermits(1)(
+          Effect.gen(function*() {
+            if (!isCurrentWindow(key, state)) return
+            const stalled = [...state.pending.entries()].filter(
+              ([, entry]) => at - entry.lastUpdatedAt >= windowOptions.stallMs,
+            )
+            for (const [entryId] of stalled) {
+              const buffered = state.pending.get(entryId)
+              if (buffered === undefined) continue
+              state.pending.delete(entryId)
+              state.flushed.add(entryId)
+              yield* appendUnlocked(key, { replica: "conversation", change: buffered.latest })
+            }
+          }),
+        )
+        if (!isCurrentWindow(key, state)) return
         if (state.pending.size === 0) {
           state.timerScheduled = false
           return
@@ -470,29 +495,32 @@ export const makeLiveHubLayer = (
       if (!streaming) {
         if (change.type === "entry.upserted") {
           // A terminal upsert: resolve the entry's buffered intermediate states first (C-2).
-          const state = windowState(key)
-          const entryId = change.entry.id
-          const alreadyFlushed = state.flushed.has(entryId)
-          const buffered = state.pending.get(entryId)
-          dropEntry(state, entryId)
-          // The entry's streaming lifecycle is over: its "was flushed" fact is no longer needed.
-          state.flushed.delete(entryId)
-          if (alreadyFlushed) {
-            // The client has already seen intermediate states of this entry: drop the rest and
-            // publish the terminal one alone.
-            return append(key, { replica: "conversation", change })
-          }
-          if (buffered !== undefined) {
-            // The client has not seen any intermediate state yet: publish the last one first, so
-            // the stream still grows, then the terminal one. Both go out under one lock, so no
-            // other change can slip between them.
-            return appendPair(
-              key,
-              { replica: "conversation", change: buffered.latest },
-              { replica: "conversation", change },
-            )
-          }
-          return append(key, { replica: "conversation", change })
+          // The whole resolution happens under one lock, so a reset cannot slip between reading
+          // the buffer and publishing it (the old epoch's buffer must not reach the new epoch).
+          return lock.withPermits(1)(
+            Effect.gen(function*() {
+              const state = windowState(key)
+              const entryId = change.entry.id
+              const alreadyFlushed = state.flushed.has(entryId)
+              const buffered = state.pending.get(entryId)
+              dropEntry(state, entryId)
+              // The entry's streaming lifecycle is over: its "was flushed" fact is no longer needed.
+              state.flushed.delete(entryId)
+              if (alreadyFlushed) {
+                // The client has already seen intermediate states of this entry: drop the rest and
+                // publish the terminal one alone.
+                return yield* appendUnlocked(key, { replica: "conversation", change })
+              }
+              if (buffered !== undefined) {
+                // The client has not seen any intermediate state yet: publish the last one first,
+                // so the stream still grows, then the terminal one. Both go out under one lock, so
+                // no other change can slip between them.
+                yield* appendUnlocked(key, { replica: "conversation", change: buffered.latest })
+                return yield* appendUnlocked(key, { replica: "conversation", change })
+              }
+              return yield* appendUnlocked(key, { replica: "conversation", change })
+            }),
+          )
         }
         if (change.type === "entry.removed") {
           // A removal drops the entry's buffered states: publishing them afterwards would
@@ -555,14 +583,7 @@ export const makeLiveHubLayer = (
         }),
 
       resetConversation: (conversationId, reason) =>
-        lock.withPermits(1)(
-          Effect.gen(function*() {
-            const key = conversationReplicaKey(conversationId)
-            // A new epoch invalidates the window's buffers: the old epoch's changes are gone.
-            windowStates.delete(key)
-            return yield* resetUnlocked(key, reason)
-          }),
-        ),
+        lock.withPermits(1)(resetUnlocked(conversationReplicaKey(conversationId), reason)),
 
       activities: Effect.sync(() => [...activities.values()]),
 
