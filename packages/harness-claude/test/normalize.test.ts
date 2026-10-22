@@ -83,9 +83,9 @@ describe("ClaudeEventPipeline × claude-basic.jsonl", () => {
       turnId: turnId(0),
       item: { _tag: "Message", role: "bot", text: "Hello from the scripted Claude.", streaming: false },
     })
-    // streamed deltas came first
-    const streamed = events.find((e) => e._tag === "ItemUpserted" && e.key === "msg_fake_001:1" && e.item._tag === "Message" && e.item.streaming)
-    expect(streamed).toBeDefined()
+    // deltas are merged: they produce no event of their own
+    const streamed = events.filter((e) => e._tag === "ItemUpserted" && e.key === "msg_fake_001:1" && e.item._tag === "Message" && e.item.streaming)
+    expect(streamed).toEqual([])
   })
 
   test("Bash approval → completed shell tool with output", async () => {
@@ -289,7 +289,7 @@ describe("ClaudeEventPipeline turn bookkeeping", () => {
       parent_tool_use_id: null,
       event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "also done" } },
     })
-    expect(ofTag(delta.events, "ItemUpserted")[0]).toMatchObject({ turnId: turnId(1), key: "m2:0" })
+    expect(ofTag(delta.events, "ItemUpserted")).toEqual([]) // deltas are merged, they emit nothing
     const second = pipeline.message({ type: "result", subtype: "success", user_message_uuids: ["b"] })
     expect(ofTag(second.events, "TurnCompleted").map((e) => e.turnId)).toEqual([turnId(1)])
     expect(pipeline.busy).toBe(false)
@@ -415,6 +415,92 @@ describe("ClaudeEventPipeline turn bookkeeping", () => {
     expect(pipeline.message({ type: "brand_new_frame", x: 1 }).events).toEqual([])
     expect(pipeline.message(null).events).toEqual([])
     expect(pipeline.message({ type: "rate_limit_event" }).events).toEqual([])
+  })
+})
+
+describe("ClaudeEventPipeline × delta merge window", () => {
+  /** A pipeline on a fake clock: `at` sets the time, `advance` moves it forward. */
+  const clocked = (options: { mergeWindowMs?: number; maxSnapshotsPerEntry?: number } = {}) => {
+    let now = 0
+    const pipeline = new ClaudeEventPipeline({ ...options, now: () => now })
+    return { pipeline, at: (ms: number) => { now = ms }, advance: (ms: number) => { now += ms } }
+  }
+  const streamFrame = (event: Record<string, unknown>) => ({ type: "stream_event", parent_tool_use_id: null, api_message_id: "m1", event })
+  const msgStart = () => streamFrame({ type: "message_start", message: { id: "m1" } })
+  const blockStart = () => streamFrame({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })
+  const textDelta = (text: string) => streamFrame({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text } })
+  const assistantText = (text: string, extra: Record<string, unknown> = {}) => ({
+    type: "assistant", parent_tool_use_id: null, message: { id: "m1", role: "assistant", content: [{ type: "text", text }] }, ...extra,
+  })
+  /** Opens a turn with one streaming text block; returns the events so far. */
+  const streaming = (c: ReturnType<typeof clocked>) => {
+    const events: Array<HarnessEvent> = [...c.pipeline.send(turnId(1), "u1")]
+    events.push(...c.pipeline.message(msgStart()).events, ...c.pipeline.message(blockStart()).events)
+    return events
+  }
+  const upserts = (events: ReadonlyArray<HarnessEvent>) => ofTag(events, "ItemUpserted")
+
+  test("a delta only accumulates text; the window emits one full snapshot", () => {
+    const c = clocked()
+    streaming(c)
+    expect(upserts(c.pipeline.message(textDelta("a")).events)).toEqual([])
+    c.at(499)
+    expect(c.pipeline.flushDue()).toEqual([])
+    c.at(500)
+    expect(c.pipeline.flushDue()).toEqual([
+      { _tag: "ItemUpserted", turnId: turnId(1), key: "m1:0", item: { _tag: "Message", role: "bot", text: "a", streaming: true } },
+    ])
+    expect(c.pipeline.flushDue()).toEqual([]) // idempotent at the same instant
+  })
+
+  test("the snapshots per entry are capped; the terminal item goes out at once", () => {
+    const c = clocked({ maxSnapshotsPerEntry: 2 })
+    streaming(c)
+    let snapshots = 0
+    for (const d of ["a", "b", "c", "d"]) {
+      c.advance(500)
+      c.pipeline.message(textDelta(d))
+      snapshots += c.pipeline.flushDue().length
+    }
+    expect(snapshots).toBe(2)
+    c.advance(100) // inside the window
+    const final = c.pipeline.message(assistantText("abcd"))
+    expect(upserts(final.events)[0]?.item).toEqual({ _tag: "Message", role: "bot", text: "abcd", streaming: false })
+    expect(c.pipeline.flushDue()).toEqual([]) // no snapshot after the terminal item
+  })
+
+  test("the cliError branch carries the full text; the key is closed afterwards", () => {
+    const c = clocked()
+    streaming(c)
+    c.pipeline.message(textDelta("par"))
+    const errored = c.pipeline.message(assistantText("par", { error: "authentication_failed" }))
+    expect(upserts(errored.events)).toEqual([
+      { _tag: "ItemUpserted", turnId: turnId(1), key: "m1:0", item: { _tag: "Message", role: "bot", text: "par", streaming: true } },
+    ])
+    c.at(1000)
+    expect(c.pipeline.flushDue()).toEqual([]) // the full text left in the reader event, not in a snapshot
+  })
+
+  test("a harness-initiated turn starts once and at once; deltas add no events", () => {
+    const c = clocked()
+    c.pipeline.message(msgStart())
+    const opened = [...c.pipeline.message(blockStart()).events, ...c.pipeline.message(textDelta("a")).events]
+    expect(opened.filter((e) => e._tag === "TurnStarted")).toEqual([{ _tag: "TurnStarted", turnId: "cli-turn-1" as TurnId, initiator: "harness" }])
+    expect(c.pipeline.message(textDelta("b")).events).toEqual([])
+    c.at(500)
+    const rest = [...c.pipeline.flushDue(), ...c.pipeline.message(assistantText("ab")).events]
+    expect(rest.filter((e) => e._tag === "TurnStarted")).toEqual([])
+  })
+
+  test("event fields are unchanged: the field set of every event of the turn", () => {
+    const c = clocked()
+    const events = [...streaming(c), ...c.pipeline.message(textDelta("a")).events]
+    c.at(500)
+    events.push(...c.pipeline.flushDue(), ...c.pipeline.message(assistantText("a")).events)
+    const fields = (e: unknown) => Object.keys(e as object).sort().join(",")
+    expect(events.map(fields)).toEqual(["_tag,turnId", "_tag,label", "_tag,item,key,turnId", "_tag,item,key,turnId"])
+    expect(fields((events[2] as { item: unknown }).item)).toBe("_tag,role,streaming,text")
+    for (const e of events) expect(() => decodeEvent(e)).not.toThrow()
   })
 })
 

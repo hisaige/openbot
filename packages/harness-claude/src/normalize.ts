@@ -96,7 +96,21 @@ export interface PipelineOptions {
   readonly hostNodeId?: NodeId | undefined
   /** Id of a harness-initiated turn (default: `cli-turn-<n>`). */
   readonly newTurnId?: (() => string) | undefined
+  /**
+   * Merge window (ms): consecutive deltas of one entry are merged into a single full snapshot
+   * within the window (default 500).
+   */
+  readonly mergeWindowMs?: number
+  /** Cap on intermediate snapshots per entry (terminal-state flushes not counted; default 16). */
+  readonly maxSnapshotsPerEntry?: number
+  /** The one time source (ms), default `Date.now`; unit tests inject a fake clock. */
+  readonly now?: (() => number) | undefined
 }
+
+/** Merge window (ms) of the delta merger. */
+const MERGE_WINDOW_MS = 500
+/** Cap on intermediate snapshots per entry. */
+const MAX_SNAPSHOTS_PER_ENTRY = 16
 
 /** Gateway tools that execute on a node (`node` argument, default: the host node). */
 const NODE_TOOLS = new Set(["shell", "read_file", "write_file", "edit_file", "list_dir", "glob", "grep", "browser", "computer"])
@@ -152,6 +166,10 @@ interface OpenText {
   readonly turnId: TurnId
   readonly kind: "text" | "thinking"
   text: string
+  /** When the current window opened: the first delta's arrival, then the last snapshot. */
+  lastEmitAt: number
+  /** Intermediate snapshots already emitted for this key. */
+  snapshotCount: number
 }
 
 type ToolItem = Extract<HarnessItem, { _tag: "ToolCall" }>
@@ -192,6 +210,9 @@ export class ClaudeEventPipeline {
   private readonly outputChars: number
   private readonly structuredChars: number
   private readonly imageChars: number
+  private readonly mergeWindowMs: number
+  private readonly maxSnapshotsPerEntry: number
+  private readonly now: () => number
 
   private sessionId: string | undefined
   private resumedBaselinePending: boolean
@@ -237,6 +258,9 @@ export class ClaudeEventPipeline {
     this.outputChars = options.outputChars ?? 16_000
     this.structuredChars = options.structuredChars ?? 4000
     this.imageChars = options.imageChars ?? 512 * 1024
+    this.mergeWindowMs = options.mergeWindowMs ?? MERGE_WINDOW_MS
+    this.maxSnapshotsPerEntry = options.maxSnapshotsPerEntry ?? MAX_SNAPSHOTS_PER_ENTRY
+    this.now = options.now ?? Date.now
     this.resumedBaselinePending = options.resumed ?? false
     this.sessionId = options.sessionId
     this.hostNodeId = options.hostNodeId
@@ -804,21 +828,67 @@ export class ClaudeEventPipeline {
     return [] // content_block_stop, message_stop
   }
 
+  /**
+   * A streamed delta only accumulates text; it produces no event. The merge window decides when a
+   * full snapshot goes out (`flushDue`), so the event volume no longer grows with the delta count.
+   * The harness-initiated turn's `TurnStarted` still leaves here, straight away and only once.
+   */
   private streamText(key: string, kind: "text" | "thinking", text: string): ReadonlyArray<HarnessEvent> {
     if (text.length === 0) return []
     const opened = this.ensureTurn()
     const turnId = this.activeTurnId
     if (turnId === undefined) return opened
-    this.openTexts.set(key, { turnId, kind, text })
-    return [...opened, ...this.item(
-      key,
-      kind === "text"
-        ? { _tag: "Message", role: "bot", text, streaming: true }
-        : { _tag: "Reasoning", text, streaming: true, source: "thinking" },
-    )]
+    const open = this.openTexts.get(key)
+    this.openTexts.set(key, {
+      turnId,
+      kind,
+      text,
+      lastEmitAt: open?.lastEmitAt ?? this.now(),
+      snapshotCount: open?.snapshotCount ?? 0,
+    })
+    return opened
+  }
+
+  /**
+   * The intermediate snapshots whose window has expired: one full snapshot per open entry, at most
+   * `maxSnapshotsPerEntry` per entry. Terminal-state events do not pass through here — they go out
+   * immediately (`onAssistant` / `finalizeTurn`), so the last item of an entry is never delayed.
+   */
+  flushDue(): ReadonlyArray<HarnessEvent> {
+    const now = this.now()
+    const events: Array<HarnessEvent> = []
+    for (const [key, open] of this.openTexts) {
+      if (open.snapshotCount >= this.maxSnapshotsPerEntry) continue
+      if (now - open.lastEmitAt < this.mergeWindowMs) continue
+      open.snapshotCount += 1
+      open.lastEmitAt = now
+      events.push({
+        _tag: "ItemUpserted",
+        turnId: open.turnId,
+        key,
+        item: open.kind === "text"
+          ? { _tag: "Message", role: "bot", text: open.text, streaming: true }
+          : { _tag: "Reasoning", text: open.text, streaming: true, source: "thinking" },
+      })
+    }
+    return events
   }
 
   // ------------------------------------------------------------------------ internals: assistant / user
+
+  /**
+   * The block ended without a final item (the CLI reported an error, or the text came back empty):
+   * the accumulated text goes out as the last `streaming:true` event of that key. It is the only
+   * carrier of that text — nothing after it replays it — so it must not be dropped.
+   */
+  private pendingText(key: string, pending: OpenText): ReadonlyArray<HarnessEvent> {
+    return this.item(
+      key,
+      pending.kind === "text"
+        ? { _tag: "Message", role: "bot", text: pending.text, streaming: true }
+        : { _tag: "Reasoning", text: pending.text, streaming: true, source: "thinking" },
+    )
+  }
 
   /** Resolves the stream key of the k-th complete block of message `msgId`. */
   private blockKey(msgId: string, index: number, blockType: string): string {
@@ -862,14 +932,25 @@ export class ClaudeEventPipeline {
       if (stream) stream.finalized = true
       if (blockType === "text") {
         const text = str(rawBlock.text) ?? stream?.text ?? ""
+        const pending = this.openTexts.get(key)
         this.openTexts.delete(key)
-        if (cliError) return
-        if (text.length === 0 && !aborted) return
+        if (cliError) {
+          if (pending) events.push(...this.pendingText(key, pending))
+          return
+        }
+        if (text.length === 0 && !aborted) {
+          if (pending) events.push(...this.pendingText(key, pending))
+          return
+        }
         events.push(...this.item(key, { _tag: "Message", role: "bot", text, streaming: false, ...(aborted ? { aborted: true } : {}) }))
       } else if (blockType === "thinking") {
         const text = str(rawBlock.thinking) || stream?.text || ""
+        const pending = this.openTexts.get(key)
         this.openTexts.delete(key)
-        if (text.length === 0) return // omitted/redacted thinking display
+        if (text.length === 0) {
+          if (pending) events.push(...this.pendingText(key, pending))
+          return // omitted/redacted thinking display
+        }
         events.push(...this.item(key, { _tag: "Reasoning", text, streaming: false, source: "thinking" }))
       }
     })
