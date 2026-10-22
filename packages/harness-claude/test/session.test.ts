@@ -952,46 +952,46 @@ describe.skipIf(!supportsProcessGroups)("Claude session process lifetime (proces
 
 // ---------------------------------------------------------------------------- bounded event queue (G1)
 
-/** Collects the events one by one with a delay: the producer outruns the consumer. */
-const collectSlowly = (events: Stream.Stream<HarnessEvent>, delayMs = 1) =>
-  Effect.gen(function*() {
-    const seen: Array<HarnessEvent> = []
-    const fiber = yield* Stream.runForEach(events, (e) => Effect.sleep(delayMs).pipe(Effect.andThen(Effect.sync(() => seen.push(e))))).pipe(Effect.forkScoped({ startImmediately: true }))
-    return { events: seen, done: Fiber.join(fiber) }
-  })
+/** Runs one turn with a consumer that reads one event per millisecond: the producer outruns it. */
+const lagged = (script: Script) => Effect.gen(function*() {
+  const env = yield* makeEnv({ script })
+  const session = yield* env.driver.openSession(env.input)
+  const seen: Array<HarnessEvent> = []
+  const fiber = yield* Stream.runForEach(session.events, (e) => Effect.sleep(1).pipe(Effect.andThen(Effect.sync(() => seen.push(e))))).pipe(Effect.forkScoped({ startImmediately: true }))
+  yield* session.startTurn({ turnId: turnId(1), text: "flood", attachments: [] })
+  expect((yield* Effect.timeoutOption(Fiber.join(fiber), 10_000))._tag).toBe("Some")
+  return seen
+})
 
 /** Runs `body` with the session's log lines captured (the default logger writes to `console.log`). */
 const withLogs = async <A>(body: () => Promise<A>) => {
-  const original = console.log
-  const logs: Array<Array<unknown>> = []
+  const original = console.log, logs: Array<Array<unknown>> = []
   console.log = (...args: Array<unknown>) => { logs.push(args) }
   try { return { result: await body(), logs } } finally { console.log = original }
 }
 
-/** A CLI that floods the session: per tool call one droppable `Activity` and three critical items. */
+/** A CLI whose tool calls produce three critical items each: the queue can reach its cap without overflow. */
 const floodTools = (count: number): Script => async (fake) => {
   fake.emit(frames.init())
   for (let i = 0; i < count; i++) {
     const id = `msg_f${i}`
-    const toolUseId = `toolu_f${i}`
-    fake.emit(frames.blockStart(id, 0, { type: i % 2 === 0 ? "text" : "thinking" }))
     fake.emit(frames.messageStart(id))
-    fake.emit(frames.blockStart(id, 1, { type: "tool_use", id: toolUseId, name: "Bash", input: {} }))
-    fake.emit(frames.assistant(id, { type: "tool_use", id: toolUseId, name: "Bash", input: { command: "ls" } }))
-    fake.emit(frames.toolResult(toolUseId, "done"))
+    fake.emit(frames.blockStart(id, 0, { type: "tool_use", id: `toolu_f${i}`, name: "Bash", input: {} }))
+    fake.emit(frames.assistant(id, { type: "tool_use", id: `toolu_f${i}`, name: "Bash", input: { command: "ls" } }))
+    fake.emit(frames.toolResult(`toolu_f${i}`, "done"))
   }
+  fake.close()
 }
-
-/** A CLI that floods the session with droppable `Activity` events, then fails with the CLI's own error. */
-const floodActivity = (count: number): Script => async (fake) => {
+/** A CLI that floods with droppable `Activity` events, then leaves a text block open for the close path. */
+const floodActivity = (count: number, trail?: string): Script => async (fake) => {
   fake.emit(frames.init())
   for (let i = 0; i < count; i++) fake.emit(frames.blockStart(`msg_a${i}`, 0, { type: i % 2 === 0 ? "text" : "thinking" }))
+  if (!trail) return
   fake.emit(frames.messageStart("msg_pending"))
   fake.emit(frames.blockStart("msg_pending", 0, { type: "text", text: "" }))
-  fake.emit(frames.textDelta("msg_pending", 0, "the whole answer"))
-  fake.emit(frames.assistant("msg_pending", { type: "text", text: "the whole answer" }, { error: "rate_limit" }))
+  fake.emit(frames.textDelta("msg_pending", 0, trail))
+  fake.close()
 }
-
 /** A CLI that streams one text block and finalizes it after the merge window. */
 const slowText: Script = async (fake, input) => {
   fake.emit(frames.init())
@@ -1005,18 +1005,13 @@ const slowText: Script = async (fake, input) => {
 
 describe("bounded event queue (architecture §2.4)", () => {
   test("a consumer that lags behind: the session fails with an exact reason, the terminal events arrive, the protocol runs once", async () => {
-    const captured = await withLogs(() =>
-      run(Effect.gen(function*() {
-        const env = yield* makeEnv({ script: floodTools(30) })
-        const session = yield* env.driver.openSession(env.input)
-        const collector = yield* collectSlowly(session.events)
-        yield* session.startTurn({ turnId: turnId(1), text: "flood", attachments: [] })
-        expect((yield* Effect.timeoutOption(collector.done, 10_000))._tag).toBe("Some")
-        const failed = collector.events.find((e) => e._tag === "TurnFailed")
-        expect(failed).toMatchObject({ turnId: turnId(1), error: { code: "closed", retryable: true } })
-        expect(failed?._tag === "TurnFailed" ? failed.error.message : "").toContain("events queue overflow (capacity=64)")
-        expect(collector.events.at(-1)).toEqual({ _tag: "SessionClosed", reason: "events queue overflow (capacity=64)" })
-      })))
+    const captured = await withLogs(() => run(Effect.gen(function*() {
+      const events = yield* lagged(floodTools(30))
+      const failed = events.find((e) => e._tag === "TurnFailed")
+      expect(failed).toMatchObject({ turnId: turnId(1), error: { code: "closed", retryable: true } })
+      expect(failed?._tag === "TurnFailed" ? failed.error.message : "").toContain("events queue overflow (capacity=64)")
+      expect(events.at(-1)).toEqual({ _tag: "SessionClosed", reason: "events queue overflow (capacity=64)" })
+    })))
     const overflows = captured.logs.filter((args) => args.some((a) => String(a).includes("events queue overflow")))
     expect(overflows).toHaveLength(1)
     const overflow = overflows[0]?.[2] as { reason?: string; rejected?: string } | undefined
@@ -1024,21 +1019,24 @@ describe("bounded event queue (architecture §2.4)", () => {
     expect(overflow?.rejected).toBe("ItemUpserted")
   })
 
-  test("the reader's full-text event survives the drop threshold: it is queued, never silently dropped", async () => {
-    const captured = await withLogs(() =>
-      run(Effect.gen(function*() {
-        const env = yield* makeEnv({ script: floodActivity(60) })
-        const session = yield* env.driver.openSession(env.input)
-        const collector = yield* collectSlowly(session.events)
-        yield* session.startTurn({ turnId: turnId(1), text: "flood", attachments: [] })
-        yield* waitUntil(() => collector.events.some((e) => e._tag === "ItemUpserted"), "the full-text event")
-        expect(collector.events.find((e) => e._tag === "ItemUpserted")).toMatchObject({ item: { _tag: "Message", text: "the whole answer", streaming: true } })
-        // The droppable `Activity` events gave way; the critical one did not.
-        expect(collector.events.filter((e) => e._tag === "Activity").length).toBeLessThan(60)
-      })))
-    const summary = captured.logs.find((args) => args.some((a) => String(a).includes("events queue summary")))
-    const annotations = summary?.[2] as { dropped?: number } | undefined
-    expect(annotations?.dropped).toBeGreaterThan(0)
+  test("closing with a full queue: the body's terminal item arrives and the summary counts the close-path clear", async () => {
+    const captured = await withLogs(() => run(Effect.gen(function*() {
+      // Depth 48..63 at close: the terminal body would be a droppable snapshot if `finish` were labeled `flush`.
+      const deep = yield* lagged(floodActivity(60, "the whole answer"))
+      const body = deep.filter((e) => e._tag === "ItemUpserted" && e.item._tag === "Message")
+      expect(body.at(-1)).toMatchObject({ item: { _tag: "Message", text: "the whole answer", streaming: false } })
+      // A full queue at close: no consumer, so the clear that makes room for the terminal events must be counted.
+      const full = yield* makeEnv({ script: floodTools(20) })
+      const closing = yield* full.driver.openSession(full.input)
+      yield* closing.startTurn({ turnId: turnId(1), text: "flood", attachments: [] })
+      yield* Effect.sleep(700)
+      expect((yield* Effect.timeoutOption(Stream.runCollect(closing.events), 3_000))._tag).toBe("Some")
+    })))
+    const summaries = captured.logs.filter((args) => args.some((a) => String(a).includes("events queue summary")))
+    expect(summaries).toHaveLength(2)
+    const [deepQueue, atClose] = summaries.map((args) => args[2] as { dropped?: number; cleared?: number; overflowed?: boolean })
+    expect(deepQueue?.dropped).toBeGreaterThan(0)
+    expect(atClose).toMatchObject({ dropped: 0, cleared: 63, overflowed: false })
   })
 
   test("a window snapshot never follows the terminal item of its key (INV-10)", () =>
