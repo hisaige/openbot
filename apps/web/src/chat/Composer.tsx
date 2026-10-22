@@ -38,7 +38,8 @@ export interface ComposerProps {
   readonly allowEveryone?: boolean
   readonly working?: boolean
   readonly onStop?: () => void
-  readonly onSubmit: (draft: ComposerSubmit) => void | Promise<unknown>
+  /** `false` (returned at once): not sent, the draft stays (New chat with nobody picked). */
+  readonly onSubmit: (draft: ComposerSubmit) => void | false | Promise<unknown>
   readonly replyTo?: MessageEntry | undefined
   readonly replyAuthor?: string | undefined
   readonly onCancelReply?: () => void
@@ -49,6 +50,14 @@ export interface ComposerProps {
 }
 
 const drafts = new Map<string, string>()
+const draftsBeingFinished = new Map<string, Promise<unknown>>()
+
+const holdDraft = (draftKey: string, until: Promise<unknown>) => {
+  draftsBeingFinished.set(draftKey, until)
+  void until.finally(() => {
+    if (draftsBeingFinished.get(draftKey) === until) draftsBeingFinished.delete(draftKey)
+  })
+}
 const MAX_LINES = 6
 const LINE = 20
 
@@ -191,28 +200,76 @@ export function Composer(props: ComposerProps): ReactNode {
       setDictatingInto(undefined)
     },
     onError: (message) => toast({ title: message, tone: "danger" }),
+    onFinishing: (finishing) => holdDraft(draftKey, finishing),
   })
 
+  const [draftBusyElsewhere, setDraftBusyElsewhere] = useState(() => draftsBeingFinished.has(draftKey))
+  useEffect(() => {
+    const finishing = draftsBeingFinished.get(draftKey)
+    if (finishing === undefined) return
+    let mounted = true
+    void finishing.finally(() => {
+      if (!mounted) return
+      setDraftBusyElsewhere(false)
+      setText(drafts.get(draftKey) ?? "")
+    })
+    return () => {
+      mounted = false
+    }
+  }, [draftKey])
+
   const ready = uploads.filter((u) => u.attachment)
-  const canSend = !props.disabled && !uploading && dictation.phase === "idle" && (text.trim().length > 0 || ready.length > 0)
+  const dictating = dictation.phase !== "idle"
+  // while the microphone starts there is nothing spoken yet: Send sends what is typed, if anything
+  const speaking = dictation.phase === "recording" || dictation.phase === "finishing"
+  const canSend = !props.disabled && !uploading && !draftBusyElsewhere && (speaking || text.trim().length > 0 || ready.length > 0)
+  const sendingDictation = useRef(false)
+  // read when the send happens (after a transcript finishes, maybe after this Composer unmounted):
+  // the files, the reply and where it goes as they are then (New chat's recipients picked meanwhile)
+  const current = useRef({ uploads, uploading, replyTo: props.replyTo, onSubmit: props.onSubmit })
+  useLayoutEffect(() => {
+    current.current = { uploads, uploading, replyTo: props.replyTo, onSubmit: props.onSubmit }
+  })
 
   const submit = async () => {
     if (!canSend) return
-    const body = text.trim()
+    if (!dictating) return send(text)
+    if (sendingDictation.current || dictatingInto === undefined) return
+    sendingDictation.current = true
+    try {
+      const spoken = await dictation.finish()
+      if (spoken !== undefined) await send(insertDictation(dictatingInto.base, dictatingInto.caret, spoken).text)
+    } finally {
+      sendingDictation.current = false
+    }
+  }
+
+  const send = async (draft: string) => {
+    const { uploads: attached, uploading: stillUploading, replyTo, onSubmit } = current.current
+    if (stillUploading) {
+      // a file was added while the transcript finished: the text stays here to send once it is up
+      toast({ title: "A file is still uploading: send again when it's done" })
+      return
+    }
+    const sentUploads = attached.filter((u) => u.attachment)
+    const body = draft.trim()
+    if (body.length === 0 && sentUploads.length === 0) return
     const scope = members ?? []
     const addressed = scope.filter((b) => new RegExp(`(^|\\s)@${b.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?=\\s|$|[.,!?:;])`, "u").test(body)).map((b) => b.id)
     const everyone = allowEveryone && /(^|\s)@everyone\b/.test(body)
-    setText("")
-    drafts.delete(draftKey)
-    setUploads([])
-    setMention(undefined)
-    await props.onSubmit({
+    const submitted = onSubmit({
       text: body,
-      attachmentIds: ready.map((u) => u.attachment!.id),
+      attachmentIds: sentUploads.map((u) => u.attachment!.id),
       addressedBotIds: addressed,
       addressEveryone: everyone,
-      replyToId: props.replyTo?.id,
+      replyToId: replyTo?.id,
     })
+    if (submitted === false) return
+    setText("")
+    drafts.delete(draftKey)
+    setUploads((all) => all.filter((u) => !sentUploads.includes(u)))
+    setMention(undefined)
+    await submitted
   }
 
   const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -346,7 +403,7 @@ export function Composer(props: ComposerProps): ReactNode {
             rows={1}
             value={text}
             disabled={props.disabled}
-            readOnly={dictation.phase !== "idle"}
+            readOnly={dictation.phase !== "idle" || draftBusyElsewhere}
             aria-label={placeholder}
             placeholder={placeholder}
             enterKeyHint={phone ? "enter" : "send"}
@@ -370,7 +427,7 @@ export function Composer(props: ComposerProps): ReactNode {
             )}
           />
           {props.context && <ContextRing {...props.context} />}
-          {dictation.available && !props.disabled && <DictationButton dictation={dictation} size={phone ? 36 : 28} />}
+          {draftBusyElsewhere ? <Spinner size={14} label="Finishing the transcript" /> : dictation.available && !props.disabled && <DictationButton dictation={dictation} size={phone ? 36 : 28} />}
           {working && (
             <IconButton icon={Square} label="Stop" title="Stop the Bot" size={phone ? 36 : 28} variant={text.trim() ? "secondary" : "primary"} iconSize="xs" onClick={props.onStop} className="[&_svg]:fill-current" />
           )}

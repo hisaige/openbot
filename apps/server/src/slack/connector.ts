@@ -9,7 +9,8 @@
  *   `disconnect` and dropped sockets reconnect (backoff up to a minute). Message events from others
  *   (not edits, joins or the owner's own) become `events`; the owner's "Send to OpenBot" clicks
  *   (message shortcut) become `shortcuts`, answered in Slack through the click's `response_url`
- *   (anyone else's click is told it isn't theirs).
+ *   (anyone else's click is told it isn't theirs). So do the owner's own messages that mention the
+ *   app ("@OpenBot remind me later": its bot user, known by the app id), with no note in Slack.
  */
 import {
   InvalidInput,
@@ -63,6 +64,8 @@ interface User {
   readonly title: string
   readonly deleted: boolean
   readonly bot: boolean
+  /** A Slack app's bot user: the app's id. */
+  readonly appId?: string | undefined
 }
 
 const CACHE_MS = 10 * 60_000
@@ -82,6 +85,7 @@ const toUser = (raw: Record<string, any>): User => {
     title: String(profile.title ?? ""),
     deleted: raw.deleted === true,
     bot: raw.is_bot === true || raw.id === "USLACKBOT",
+    ...(typeof profile.api_app_id === "string" && profile.api_app_id !== "" ? { appId: profile.api_app_id } : {}),
   }
 }
 
@@ -292,7 +296,7 @@ export const makeSlackConnector = (options: SlackConnectorOptions) =>
     /** A conversation itself (where a message without a ts yet went). */
     const placeLinkOf = (channelId: string): string => `${(saved?.teamUrl ?? "https://slack.com/").replace(/\/?$/, "/")}archives/${channelId}`
 
-    const mentionedIds = (text: string): Array<string> => [...text.matchAll(/<@([UW][A-Z0-9]+)(?:\|[^>]*)?>/g)].map((m) => m[1]!)
+    const mentionedIds = (text: string): Array<string> => [...text.matchAll(/<@([UW][A-Z0-9_]+)(?:\|[^>]*)?>/g)].map((m) => m[1]!)
 
     const textOf = (raw: Record<string, any>): string => {
       const own = String(raw.text ?? "")
@@ -392,7 +396,12 @@ export const makeSlackConnector = (options: SlackConnectorOptions) =>
       const current = saved
       if (current === undefined || event === undefined || event.type !== "message") return
       if (event.subtype !== undefined && !SAID.has(String(event.subtype))) return
-      if (event.hidden === true || event.user === current.userId) return
+      if (event.hidden === true) return
+      if (event.user === current.userId) {
+        // the owner's own words start nothing, unless they mention the app: then it's a Send to OpenBot
+        if (await mentionsApp(String(event.text ?? ""))) await forwardMention(event)
+        return
+      }
       const channelId = String(event.channel)
       const [where, messages] = await Promise.all([conversation(channelId), toMessages([event], channelId)])
       const text = String(event.text ?? "")
@@ -401,6 +410,21 @@ export const makeSlackConnector = (options: SlackConnectorOptions) =>
         message: messages[0]!,
         mentionsOwner: text.includes(`<@${current.userId}>`) || text.includes(`<@${current.userId}|`),
       })
+    }
+
+    /** Whether `text` mentions this app's bot user ("@OpenBot", picked from Slack's suggestions). */
+    const mentionsApp = async (text: string): Promise<boolean> => {
+      const ids = mentionedIds(text)
+      if (ids.length === 0 || appId === undefined) return false
+      await ensureUsers(ids)
+      return ids.some((id) => users.get(id)?.appId === appId)
+    }
+
+    /** The owner's message that mentions the app: handled like their "Send to OpenBot" click on it, silently (nothing is posted in Slack). */
+    const forwardMention = async (event: Record<string, any>) => {
+      const channelId = String(event.channel)
+      const [where, messages] = await Promise.all([conversation(channelId), toMessages([event], channelId)])
+      PubSub.publishUnsafe(shortcuts, { via: "mention" as const, conversation: where, message: messages[0]!, reply: () => Effect.void })
     }
 
     /** "Send to OpenBot" on a message: the owner's click becomes a shortcut; anyone else is told no. */
@@ -421,7 +445,7 @@ export const makeSlackConnector = (options: SlackConnectorOptions) =>
       }
       const channelId = String(payload.channel?.id ?? "")
       const [where, messages] = await Promise.all([conversation(channelId), toMessages([payload.message ?? {}], channelId)])
-      PubSub.publishUnsafe(shortcuts, { conversation: where, message: messages[0]!, reply: (text) => Effect.promise(() => reply(text)) })
+      PubSub.publishUnsafe(shortcuts, { via: "click" as const, conversation: where, message: messages[0]!, reply: (text) => Effect.promise(() => reply(text)) })
     }
 
     const listen = (appToken: string, owner: Saved) => {

@@ -2,6 +2,7 @@
  * Slack's "Send to OpenBot" (D3.4): the owner's click on a message in Slack posts it into a Bot's
  * chat as the owner's own message (where it came from, who wrote it, the start of it, its link) and
  * wakes the Bot, which reads the thread with its Slack tools. Slack shows the owner "Sent to ‹Bot›".
+ * The owner's own messages that mention @OpenBot do the same, unless Settings `slackMentions` is off.
  * The Bot: Settings `slackSendTo`, else the one the owner chatted with last.
  */
 import type { Bot } from "@openbot/contracts"
@@ -54,6 +55,7 @@ export const SlackShortcutsLive: Layer.Layer<never, never, Orchestrator | Settin
 
     const forward = (shortcut: SlackShortcut) =>
       Effect.gen(function*() {
+        if (shortcut.via === "mention" && !(yield* settings.get).slackMentions) return
         const bot = yield* recipient
         if (bot === undefined) return yield* shortcut.reply("There's no Bot in OpenBot yet: create one first.")
         const now = yield* Clock.currentTimeMillis

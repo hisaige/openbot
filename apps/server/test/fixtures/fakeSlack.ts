@@ -3,8 +3,9 @@
 // (U_ALICE, @alice, DM D_ALICE), Bob (U_BOB); #general (C_GENERAL). `push` sends a Socket Mode
 // envelope; `posted`, `acks`, `responses` (replies to shortcut clicks, through `response_url`),
 // `uploads` (files' bytes, through the URL `files.getUploadURLExternal` hands out) and `shared`
-// (`files.completeUploadExternal`) record what OpenBot sent. `setScopes` changes the token's scopes
-// (an app updated in Slack).
+// (`files.completeUploadExternal`) and `ephemeral` (`chat.postEphemeral`) record what OpenBot sent.
+// `setScopes` changes the token's scopes (an app updated in Slack). The app's bot user "OpenBot"
+// (U_OPENBOT, app A_OPENBOT) is only known to `users.info`, like one added after people were cached.
 import type { Server, ServerWebSocket } from "bun"
 
 export const FAKE_USER_TOKEN = "xoxp-good"
@@ -19,6 +20,7 @@ const members = [
   { id: "U_ALICE", name: "alice", real_name: "Alice Smith", profile: { display_name: "", real_name: "Alice Smith", title: "Designer" } },
   { id: "U_BOB", name: "bob", real_name: "Bob Jones", profile: { display_name: "Bob", real_name: "Bob Jones", title: "" } },
 ]
+const appBot = { id: "U_OPENBOT", name: "openbot", is_bot: true, profile: { display_name: "OpenBot", real_name: "OpenBot", api_app_id: "A_OPENBOT" } }
 const channels = [
   { id: "C_GENERAL", name: "general", is_channel: true, is_private: false, topic: { value: "Company news" } },
   { id: "D_ALICE", is_im: true, user: "U_ALICE" },
@@ -32,6 +34,7 @@ export interface FakeSlack {
   readonly responses: ReadonlyArray<Record<string, unknown>>
   readonly uploads: ReadonlyArray<{ readonly fileId: string; readonly filename: string; readonly length: number; readonly bytes: number; readonly authorized: boolean }>
   readonly shared: ReadonlyArray<Record<string, string>>
+  readonly ephemeral: ReadonlyArray<Record<string, string>>
   readonly setScopes: (scopes: string) => void
   /** The `response_url` a shortcut click carries. */
   readonly responseUrl: string
@@ -48,6 +51,7 @@ export const startFakeSlack = (options?: { readonly scopes?: string }): FakeSlac
   const responses: Array<Record<string, unknown>> = []
   const uploads: Array<{ fileId: string; filename: string; length: number; bytes: number; authorized: boolean }> = []
   const shared: Array<Record<string, string>> = []
+  const ephemeral: Array<Record<string, string>> = []
   let scopes = options?.scopes ?? ALL_SCOPES
   const sockets = new Set<ServerWebSocket<unknown>>()
   let server: Server<unknown>
@@ -88,7 +92,7 @@ export const startFakeSlack = (options?: { readonly scopes?: string }): FakeSlac
         case "users.list":
           return ok({ members, response_metadata: { next_cursor: "" } })
         case "users.info": {
-          const user = members.find((m) => m.id === args.user)
+          const user = [...members, appBot].find((m) => m.id === args.user)
           return user === undefined ? fail("user_not_found") : ok({ user })
         }
         case "users.conversations":
@@ -131,6 +135,9 @@ export const startFakeSlack = (options?: { readonly scopes?: string }): FakeSlac
         case "chat.postMessage":
           posted.push(args)
           return ok({ channel: args.channel, ts: "1729340400.000100" })
+        case "chat.postEphemeral":
+          ephemeral.push(args)
+          return ok({ message_ts: "1729340500.000100" })
         case "files.getUploadURLExternal": {
           if (!scopes.split(",").includes("files:write")) return Response.json({ ok: false, error: "missing_scope", needed: "files:write" })
           const fileId = `F_${uploads.length + 1}`
@@ -169,6 +176,7 @@ export const startFakeSlack = (options?: { readonly scopes?: string }): FakeSlac
     responses,
     uploads,
     shared,
+    ephemeral,
     setScopes: (next) => {
       scopes = next
     },

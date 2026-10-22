@@ -3,10 +3,11 @@
 // Token, and optionally an app-level token for live messages (Socket Mode). Tokens go to the brain
 // and are never shown again. Connected: an update notice when the app lacks newer permissions (made
 // from an older manifest), the workspace, live messages, "Send to OpenBot" (the message shortcut:
-// which Bot gets it, and the one-time manifest update for apps made before it) and Disconnect.
+// which Bot gets it, whether your own @OpenBot mentions do the same, and the one-time manifest
+// update for apps made before it) and Disconnect.
 import { slackStatusAtom } from "@openbot/client"
 import { type BotId, SLACK_SHORTCUT_NAME, type SlackStatus, slackAppManifest, slackCreateAppUrl } from "@openbot/contracts"
-import { CardLink, PillButton, Select, StatusPill, TextField } from "@openbot/ui"
+import { CardLink, PillButton, Select, StatusPill, Switch, TextField } from "@openbot/ui"
 import { ExternalLink } from "lucide-react"
 import { type ReactNode, useState } from "react"
 import { ConfirmDialog, ErrorLine, LoadingLine, useCommand, useQuery } from "../details/kit.tsx"
@@ -274,7 +275,7 @@ function Connected({ status }: { readonly status: SlackStatus }): ReactNode {
 
 const LAST_CHATTED = "__last__"
 
-/** Slack's "Send to OpenBot" message shortcut: where it goes, and adding it to an older Slack app. */
+/** Slack's "Send to OpenBot" message shortcut (and @OpenBot mentions): where it goes, and adding it to an older Slack app. */
 function SendToOpenBot({ status }: { readonly status: SlackStatus }): ReactNode {
   const roster = useRoster()
   const { settings, patch, error } = useSettingsEditor()
@@ -284,7 +285,7 @@ function SendToOpenBot({ status }: { readonly status: SlackStatus }): ReactNode 
       <SettingsCard testId="slack-send-to">
         <SettingsRow
           title="Goes to"
-          description={`In Slack, ⋯ on any message › ${SLACK_SHORTCUT_NAME} puts it, with its thread, in this Bot's chat.${status.events === "live" ? "" : " Needs live messages (above)."}`}
+          description={`In Slack, ⋯ on any message › ${SLACK_SHORTCUT_NAME}${settings.slackMentions ? ", or @OpenBot in a message you write," : ""} puts it with its thread in this Bot's chat.${status.events === "live" ? "" : " Needs live messages (above)."}`}
           control={
             <Select<string>
               label="Send to"
@@ -296,6 +297,14 @@ function SendToOpenBot({ status }: { readonly status: SlackStatus }): ReactNode 
         >
           {error && <p className="text-sm text-danger-fg">{error}</p>}
         </SettingsRow>
+        <RowDivider />
+        <SettingsRow
+          title="When you mention @OpenBot"
+          description="A message you write that mentions @OpenBot (pick it from Slack's suggestions) goes there too, like Send to OpenBot: “@OpenBot remind me of this tomorrow”."
+          control={
+            <Switch checked={settings.slackMentions} onCheckedChange={(slackMentions) => void patch({ slackMentions })} label="Send my @OpenBot mentions" />
+          }
+        />
         <RowDivider />
         <SettingsRow
           title="Add it to your Slack app"

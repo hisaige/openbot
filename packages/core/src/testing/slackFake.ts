@@ -29,7 +29,7 @@ export interface SlackSent {
 
 export class SlackConnectorFake extends Context.Service<SlackConnectorFake, {
   readonly emit: (event: SlackEvent) => Effect.Effect<void>
-  readonly click: (shortcut: Omit<SlackShortcut, "reply">) => Effect.Effect<void>
+  readonly click: (shortcut: Omit<SlackShortcut, "reply" | "via"> & { readonly via?: SlackShortcut["via"] }) => Effect.Effect<void>
   readonly sent: Effect.Effect<ReadonlyArray<SlackSent>>
   readonly replies: Effect.Effect<ReadonlyArray<string>>
   readonly setConnected: (connected: boolean) => Effect.Effect<void>
@@ -104,7 +104,7 @@ export class SlackConnectorFake extends Context.Service<SlackConnectorFake, {
         const fake = SlackConnectorFake.of({
           emit: (event) => Effect.asVoid(PubSub.publish(events, event)),
           click: (shortcut) =>
-            Effect.asVoid(PubSub.publish(shortcuts, { ...shortcut, reply: (text) => Effect.sync(() => void replies.push(text)) })),
+            Effect.asVoid(PubSub.publish(shortcuts, { via: "click", ...shortcut, reply: (text) => Effect.sync(() => void replies.push(text)) })),
           sent: Effect.sync(() => [...sent]),
           replies: Effect.sync(() => [...replies]),
           setConnected: (value) =>

@@ -69,6 +69,13 @@ describe.skipIf(!hasChromium)("e2e: Slack", () => {
     await connected.getByText("On", { exact: true }).waitFor()
     await app.shot("e2e-85-slack-connected")
     expect(await rpc.call((c) => c["slack.status"]())).toMatchObject({ connected: true, team: "Acme", events: "live" })
+    // your own @OpenBot mentions: on until switched off
+    const mentions = page.getByRole("switch", { name: "Send my @OpenBot mentions" })
+    expect(await mentions.getAttribute("aria-checked")).toBe("true")
+    await mentions.click()
+    await eventually(() => rpc.call((c) => c["settings.get"]()), (s) => s.slackMentions === false, { label: "mentions off" })
+    await mentions.click()
+    await eventually(() => rpc.call((c) => c["settings.get"]()), (s) => s.slackMentions === true, { label: "mentions on" })
     // back in the catalog Slack is connected; "1 connected ›" lists it
     await page.getByTestId("connect-apps-back").click()
     await window.getByTestId("app-slack").getByText("Connected").waitFor()

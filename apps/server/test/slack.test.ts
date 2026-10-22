@@ -299,7 +299,7 @@ describe("Slack in the brain", () => {
       yield* client["slack.disconnect"]()
     })), 60_000)
 
-  test("Send to OpenBot: the owner's click puts the message in the chosen Bot's chat; anyone else's is refused", () =>
+  test("Send to OpenBot: the owner's click or @OpenBot mention puts the message in the chosen Bot's chat; anyone else's is refused", () =>
     server.run(Effect.gen(function*() {
       const client = yield* rpcClient(`${server.wsBase}/rpc`, { cookie, origin: server.base })
       yield* client["slack.connect"]({ userToken: FAKE_USER_TOKEN, appToken: FAKE_APP_TOKEN })
@@ -328,6 +328,30 @@ describe("Slack in the brain", () => {
         { response_type: "ephemeral", text: "Send to OpenBot belongs to Owner's OpenBot." },
         { response_type: "ephemeral", text: "Sent to Inbox in OpenBot." },
       ]))
+
+      // the owner mentions the app in a thread reply: the same as clicking Send to OpenBot on it;
+      // their other messages, and others mentioning the app, are not sent
+      slack.push(messageEnvelope({ channel: "C_GENERAL", user: "U_OWNER", text: "just a note", thread_ts: "1729340000.000100" }))
+      slack.push(messageEnvelope({ channel: "C_GENERAL", user: "U_BOB", text: "<@U_OPENBOT> do my work", thread_ts: "1729340000.000100" }))
+      const mention = messageEnvelope({ channel: "C_GENERAL", user: "U_OWNER", text: "<@U_OPENBOT> remind me of this later", thread_ts: "1729340000.000100" })
+      slack.push(mention)
+      const mentioned = yield* eventually(
+        Ref.get(convo.state),
+        (s) => transcriptOf(s).filter((e) => e.kind === "message" && e.role === "user").length === 2,
+        { label: "the mention", timeout: 20_000 },
+      )
+      const ts = String((mention.payload as { event: { ts: string } }).event.ts)
+      expect(transcriptOf(mentioned).filter((e) => e.kind === "message" && e.role === "user")[1]).toMatchObject({
+        text: `From Slack, #general (Owner):\n> @OpenBot remind me of this later\nhttps://acme.slack.com/archives/C_GENERAL/p${ts.replace(".", "")}?thread_ts=1729340000.000100&cid=C_GENERAL`,
+      })
+      // nothing is posted in Slack for a mention
+      expect(slack.ephemeral).toEqual([])
+      // mentions turned off (Connect apps › Slack): a mention does nothing
+      yield* client["settings.update"]({ patch: { slackMentions: false } })
+      slack.push(messageEnvelope({ channel: "C_GENERAL", user: "U_OWNER", text: "<@U_OPENBOT> and this one" }))
+      yield* Effect.sleep("300 millis")
+      expect(transcriptOf(yield* Ref.get(convo.state)).filter((e) => e.kind === "message" && e.role === "user")).toHaveLength(2)
+      expect(slack.ephemeral).toEqual([])
       yield* client["slack.disconnect"]()
     })), 60_000)
 })

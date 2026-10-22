@@ -40,6 +40,8 @@ export const Settings = Schema.Struct({
   defaultAutonomy: BotAutonomy.pipe(Schema.withDecodingDefaultKey(Effect.succeed(DEFAULT_BOT_AUTONOMY))),
   /** Where Slack's "Send to OpenBot" puts a message (D3.4); absent: the Bot chatted with last. */
   slackSendTo: Schema.optionalKey(BotId),
+  /** The owner's own Slack messages that mention @OpenBot go there too, like Send to OpenBot (D3.4). */
+  slackMentions: Schema.Boolean.pipe(Schema.withDecodingDefaultKey(Effect.succeed(true))),
 })
 export type Settings = typeof Settings.Type
 
@@ -53,6 +55,7 @@ export const DEFAULT_SETTINGS: Settings = {
   approvalExpiryMinutes: DEFAULT_APPROVAL_EXPIRY_MINUTES,
   sharedProjectFolders: [],
   defaultAutonomy: DEFAULT_BOT_AUTONOMY,
+  slackMentions: true,
 }
 
 /** `settings.update` input: any subset of keys. */
@@ -71,6 +74,7 @@ export const SettingsPatch = Schema.Struct({
   defaultAutonomy: Schema.optionalKey(BotAutonomy),
   /** `null`: the Bot chatted with last. */
   slackSendTo: Schema.optionalKey(Schema.NullOr(BotId)),
+  slackMentions: Schema.optionalKey(Schema.Boolean),
 })
 export type SettingsPatch = typeof SettingsPatch.Type
 
@@ -86,6 +90,7 @@ export const applySettingsPatch = (settings: Settings, patch: SettingsPatch): Se
   if (patch.approvalExpiryMinutes !== undefined) next.approvalExpiryMinutes = patch.approvalExpiryMinutes
   if (patch.sharedProjectFolders !== undefined) next.sharedProjectFolders = patch.sharedProjectFolders
   if (patch.defaultAutonomy !== undefined) next.defaultAutonomy = patch.defaultAutonomy
+  if (patch.slackMentions !== undefined) next.slackMentions = patch.slackMentions
   if (patch.defaultHarness === null) delete next.defaultHarness
   else if (patch.defaultHarness !== undefined) next.defaultHarness = patch.defaultHarness
   if (patch.ownerName === null) delete next.ownerName

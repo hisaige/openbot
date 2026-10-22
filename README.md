@@ -165,7 +165,9 @@ add a routine with the **Slack** trigger (Details › Routines), or ask the Bot.
 
 To hand a Slack message or thread to a Bot, use **⋯ › Send to OpenBot** on the message in Slack. It
 lands in the chat of the Bot you pick under Connect apps › Slack (or the Bot you chatted with last),
-with its link, and the Bot reads the whole thread. It needs live messages on. An app created before
+with its link, and the Bot reads the whole thread. Mentioning **@OpenBot** in a message you write (pick
+it from Slack's suggestions) does the same, e.g. "@OpenBot remind me of this tomorrow"; you can turn
+that off under Connect apps › Slack. Both need live messages on. An app created before
 this option existed needs its manifest updated once: Connect apps › Slack has the steps.
 
 ### Hark: notifications on your iPhone
