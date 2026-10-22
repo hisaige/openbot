@@ -11,8 +11,9 @@
  *   prompt input, `q.close()` (graceful: stdin EOF flushes the transcript), wait for the CLI to exit
  *   (bounded; then SIGKILL its process group) and drop it from the `ProcessLedger`.
  *
- * `events` is a single-consumer stream backed by an unbounded queue: events produced before the
- * runner subscribes are buffered, never lost.
+ * `events` is a single-consumer stream backed by a bounded queue (64 events): events produced
+ * before the runner subscribes are buffered; a slow consumer makes the session fail with an
+ * exact reason instead of growing without bound (architecture §2.4).
  */
 import type { ContextUsage, HarnessEvent } from "@openbot/contracts"
 import type { HarnessSession, OpenSessionInput, TurnInput } from "@openbot/core"
@@ -30,6 +31,20 @@ export const TASK_BASH_DEFAULT_TIMEOUT_MS = 30 * 60_000
 export const TASK_BASH_MAX_TIMEOUT_MS = 2 * 60 * 60_000
 
 export const HARNESS = "claude"
+
+/** Event queue capacity (architecture §2.4): bounds the bytes one session can hold. */
+export const EVENTS_QUEUE_CAPACITY = 64
+/** Slots kept for critical events: droppable events stop at `capacity - reserve` (architecture §2.4). */
+export const CRITICAL_RESERVE = 16
+/** How often the flush timer pushes the pipeline's due snapshots (architecture §2.4, B3). */
+export const FLUSH_TICK_MS = 100
+
+/**
+ * Where an event came from. The origin is the ONLY droppable criterion (architecture §2.4, INV-11):
+ * a flush snapshot and the reader's full-text event have the very same shape, so a shape-based
+ * criterion would silently truncate the answer (the text event cannot be replayed).
+ */
+export type EventOrigin = "flush" | "reader" | "lifecycle"
 
 /** Everything a session needs besides `OpenSessionInput` (resolved by the driver). */
 export interface SessionDeps {
@@ -123,16 +138,37 @@ export const openClaudeSession = Effect.fn("ClaudeSession.open")(function*(
     // Harness-initiated turns (Claude Code answering its own notifications); core maps them to its ids.
     newTurnId: () => `cli-${deps.newUuid()}`,
   })
-  const events = yield* Queue.unbounded<HarnessEvent, Cause.Done>()
+  const events = yield* Queue.bounded<HarnessEvent, Cause.Done>(EVENTS_QUEUE_CAPACITY)
   const inbox = yield* Queue.unbounded<ClaudeUserMessage, Cause.Done>()
   const commands = new Map<string, Deferred.Deferred<void, HarnessError>>()
   const closeController = new AbortController()
   let ended = false
   let stderrTail = ""
+  /** Overflow bookkeeping (architecture §2.4): dropped, cleared and the one-shot guard. */
+  const overflow = { dropped: 0, cleared: 0, handled: false }
 
-  const emit = (batch: ReadonlyArray<HarnessEvent>) => {
+  /**
+   * Enqueues `batch`, graded by origin (architecture §2.4, INV-11).
+   * Droppable ⇔ `origin === "flush"` or the event is an `Activity`; never by shape.
+   * A critical event is never dropped: it is queued, or it starts the overflow protocol.
+   */
+  const emit = (batch: ReadonlyArray<HarnessEvent>, origin: EventOrigin) => {
     if (ended) return
-    for (const event of batch) Queue.offerUnsafe(events, event)
+    for (const event of batch) {
+      if (origin === "flush" || event._tag === "Activity") {
+        // Droppable: the room for the critical events stays free.
+        if (Queue.sizeUnsafe(events) >= EVENTS_QUEUE_CAPACITY - CRITICAL_RESERVE) {
+          overflow.dropped += 1
+          continue
+        }
+        Queue.offerUnsafe(events, event)
+        continue
+      }
+      if (Queue.offerUnsafe(events, event)) continue
+      // No slot for a critical event: the queue is full (a closed queue means `ended`).
+      handleOverflow(event)
+      return
+    }
   }
   const settle = (settled: ReadonlyArray<SettledCommand>) => {
     for (const s of settled) {
@@ -148,8 +184,20 @@ export const openClaudeSession = Effect.fn("ClaudeSession.open")(function*(
   /** Terminal: emits the pipeline's close events once and ends both queues. */
   const finish = (reason: string, unexpected: boolean) => {
     if (ended) return
+    // One summary per session: the drop count is readable (architecture §2.4).
+    if (overflow.dropped > 0 || overflow.cleared > 0) {
+      Effect.runSync(Effect.logWarning("harness-claude: events queue summary", {
+        dropped: overflow.dropped,
+        cleared: overflow.cleared,
+        overflowed: overflow.handled,
+      }))
+    }
     const out = pipeline.close(reason, unexpected)
-    emit(out.events)
+    // The terminal events must arrive (INV-8): free room for them when the queue is full.
+    if (Queue.sizeUnsafe(events) + out.events.length > EVENTS_QUEUE_CAPACITY) {
+      overflow.cleared += Effect.runSync(Queue.clear(events)).length
+    }
+    emit(out.events, "lifecycle")
     settle(out.settled)
     for (const deferred of commands.values()) Deferred.doneUnsafe(deferred, Effect.fail(closedError()))
     commands.clear()
@@ -157,6 +205,23 @@ export const openClaudeSession = Effect.fn("ClaudeSession.open")(function*(
     closeController.abort()
     Queue.endUnsafe(events)
     Queue.endUnsafe(inbox)
+  }
+  /**
+   * The overflow protocol (architecture §2.4): one-shot, observable, never hanging.
+   * The backlog is cleared, the session fails with an exact reason, and `TurnFailed` +
+   * `SessionClosed` reach the consumer (INV-9). A second overflow is ignored.
+   */
+  const handleOverflow = (rejected: HarnessEvent) => {
+    if (overflow.handled) return
+    overflow.handled = true
+    const reason = `events queue overflow (capacity=${EVENTS_QUEUE_CAPACITY})`
+    Effect.runSync(Effect.logWarning("harness-claude: events queue overflow", {
+      reason,
+      dropped: overflow.dropped,
+      rejected: rejected._tag,
+    }))
+    overflow.cleared += Effect.runSync(Queue.clear(events)).length
+    finish(reason, true)
   }
   const pushStderr = (chunk: string) => {
     stderrTail = (stderrTail + chunk).slice(-STDERR_TAIL_CHARS)
@@ -310,7 +375,7 @@ export const openClaudeSession = Effect.fn("ClaudeSession.open")(function*(
     Stream.runForEach((frame) =>
       Effect.sync(() => {
         const out = pipeline.message(frame)
-        emit(out.events)
+        emit(out.events, "reader")
         settle(out.settled)
       })
     ),
@@ -320,10 +385,27 @@ export const openClaudeSession = Effect.fn("ClaudeSession.open")(function*(
     }),
     Effect.forkScoped({ startImmediately: true }),
   )
+  // ---------------------------------------------------------------- flush timer (window snapshots)
+  // The pipeline merges the deltas of a block; its due snapshots leave every 100ms (architecture
+  // §2.4, B3). `flushDue()` and the enqueue share one `Effect.sync` block, so a snapshot can
+  // never interleave with the terminal item of the same key (INV-10).
+  yield* Effect.forkScoped(
+    Effect.forever(
+      Effect.sleep(FLUSH_TICK_MS).pipe(
+        Effect.andThen(
+          Effect.sync(() => {
+            if (ended) return
+            const due = pipeline.flushDue()
+            if (due.length > 0) emit(due, "flush")
+          }),
+        ),
+      ),
+    ),
+  )
   // Runs first on scope close: settle everything before the reader and the process are torn down.
   yield* Effect.addFinalizer(() => Effect.sync(() => finish("closed", false)))
 
-  emit([{ _tag: "SessionBound", nativeSessionId: sessionId }])
+  emit([{ _tag: "SessionBound", nativeSessionId: sessionId }], "lifecycle")
 
   // ---------------------------------------------------------------- operations
   const buildMessage = (turn: TurnInput, uuid: string, priority?: "next") =>
@@ -343,7 +425,7 @@ export const openClaudeSession = Effect.fn("ClaudeSession.open")(function*(
       const uuid = deps.newUuid()
       const message = yield* buildMessage(turn, uuid)
       const outcome = yield* push(message, () => {
-        emit(pipeline.send(turn.turnId, uuid))
+        emit(pipeline.send(turn.turnId, uuid), "lifecycle")
         return true
       })
       if (outcome !== "accepted") return yield* Effect.fail(closedError())
@@ -380,7 +462,7 @@ export const openClaudeSession = Effect.fn("ClaudeSession.open")(function*(
     const deferred = yield* Deferred.make<void, HarnessError>()
     const outcome = yield* push(commandMessage("/compact", uuid), () => {
       commands.set(uuid, deferred)
-      emit(pipeline.command(uuid, uuid))
+      emit(pipeline.command(uuid, uuid), "lifecycle")
       return true
     })
     if (outcome !== "accepted") return yield* Effect.fail(closedError())

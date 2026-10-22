@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test"
 import type { HarnessEvent, HarnessRequest, HarnessRequestResolution } from "@openbot/contracts"
 import { type HarnessSession, HarnessRegistry, makeDataDir, type OpenSessionInput, ProcessLedger } from "@openbot/core"
 import { TestPorts } from "@openbot/core/testing"
-import { Effect, Exit, Layer, Scope } from "effect"
+import { Effect, Exit, Fiber, Layer, Scope, Stream } from "effect"
 import type { ChildProcess } from "node:child_process"
 import { existsSync, readdirSync, readFileSync, realpathSync } from "node:fs"
 import { join } from "node:path"
@@ -947,5 +947,107 @@ describe.skipIf(!supportsProcessGroups)("Claude session process lifetime (proces
       expect(Date.now() - started).toBeLessThan(1500)
       expect(ledger.at(-1)).toBe(`-${pid}`)
       yield* waitUntil(() => !groupAlive(pid), "process group gone")
+    })))
+})
+
+// ---------------------------------------------------------------------------- bounded event queue (G1)
+
+/** Collects the events one by one with a delay: the producer outruns the consumer. */
+const collectSlowly = (events: Stream.Stream<HarnessEvent>, delayMs = 1) =>
+  Effect.gen(function*() {
+    const seen: Array<HarnessEvent> = []
+    const fiber = yield* Stream.runForEach(events, (e) => Effect.sleep(delayMs).pipe(Effect.andThen(Effect.sync(() => seen.push(e))))).pipe(Effect.forkScoped({ startImmediately: true }))
+    return { events: seen, done: Fiber.join(fiber) }
+  })
+
+/** Runs `body` with the session's log lines captured (the default logger writes to `console.log`). */
+const withLogs = async <A>(body: () => Promise<A>) => {
+  const original = console.log
+  const logs: Array<Array<unknown>> = []
+  console.log = (...args: Array<unknown>) => { logs.push(args) }
+  try { return { result: await body(), logs } } finally { console.log = original }
+}
+
+/** A CLI that floods the session: per tool call one droppable `Activity` and three critical items. */
+const floodTools = (count: number): Script => async (fake) => {
+  fake.emit(frames.init())
+  for (let i = 0; i < count; i++) {
+    const id = `msg_f${i}`
+    const toolUseId = `toolu_f${i}`
+    fake.emit(frames.blockStart(id, 0, { type: i % 2 === 0 ? "text" : "thinking" }))
+    fake.emit(frames.messageStart(id))
+    fake.emit(frames.blockStart(id, 1, { type: "tool_use", id: toolUseId, name: "Bash", input: {} }))
+    fake.emit(frames.assistant(id, { type: "tool_use", id: toolUseId, name: "Bash", input: { command: "ls" } }))
+    fake.emit(frames.toolResult(toolUseId, "done"))
+  }
+}
+
+/** A CLI that floods the session with droppable `Activity` events, then fails with the CLI's own error. */
+const floodActivity = (count: number): Script => async (fake) => {
+  fake.emit(frames.init())
+  for (let i = 0; i < count; i++) fake.emit(frames.blockStart(`msg_a${i}`, 0, { type: i % 2 === 0 ? "text" : "thinking" }))
+  fake.emit(frames.messageStart("msg_pending"))
+  fake.emit(frames.blockStart("msg_pending", 0, { type: "text", text: "" }))
+  fake.emit(frames.textDelta("msg_pending", 0, "the whole answer"))
+  fake.emit(frames.assistant("msg_pending", { type: "text", text: "the whole answer" }, { error: "rate_limit" }))
+}
+
+/** A CLI that streams one text block and finalizes it after the merge window. */
+const slowText: Script = async (fake, input) => {
+  fake.emit(frames.init())
+  fake.emit(frames.messageStart("msg_g1"))
+  fake.emit(frames.blockStart("msg_g1", 0, { type: "text", text: "" }))
+  fake.emit(frames.textDelta("msg_g1", 0, "partial answer"))
+  await Bun.sleep(900)
+  fake.emit(frames.assistant("msg_g1", { type: "text", text: "partial answer" }))
+  fake.emit(frames.result(echo(input.uuid)))
+}
+
+describe("bounded event queue (architecture §2.4)", () => {
+  test("a consumer that lags behind: the session fails with an exact reason, the terminal events arrive, the protocol runs once", async () => {
+    const captured = await withLogs(() =>
+      run(Effect.gen(function*() {
+        const env = yield* makeEnv({ script: floodTools(30) })
+        const session = yield* env.driver.openSession(env.input)
+        const collector = yield* collectSlowly(session.events)
+        yield* session.startTurn({ turnId: turnId(1), text: "flood", attachments: [] })
+        expect((yield* Effect.timeoutOption(collector.done, 10_000))._tag).toBe("Some")
+        const failed = collector.events.find((e) => e._tag === "TurnFailed")
+        expect(failed).toMatchObject({ turnId: turnId(1), error: { code: "closed", retryable: true } })
+        expect(failed?._tag === "TurnFailed" ? failed.error.message : "").toContain("events queue overflow (capacity=64)")
+        expect(collector.events.at(-1)).toEqual({ _tag: "SessionClosed", reason: "events queue overflow (capacity=64)" })
+      })))
+    const overflows = captured.logs.filter((args) => args.some((a) => String(a).includes("events queue overflow")))
+    expect(overflows).toHaveLength(1)
+    const overflow = overflows[0]?.[2] as { reason?: string; rejected?: string } | undefined
+    expect(overflow?.reason).toBe("events queue overflow (capacity=64)")
+    expect(overflow?.rejected).toBe("ItemUpserted")
+  })
+
+  test("the reader's full-text event survives the drop threshold: it is queued, never silently dropped", async () => {
+    const captured = await withLogs(() =>
+      run(Effect.gen(function*() {
+        const env = yield* makeEnv({ script: floodActivity(60) })
+        const session = yield* env.driver.openSession(env.input)
+        const collector = yield* collectSlowly(session.events)
+        yield* session.startTurn({ turnId: turnId(1), text: "flood", attachments: [] })
+        yield* waitUntil(() => collector.events.some((e) => e._tag === "ItemUpserted"), "the full-text event")
+        expect(collector.events.find((e) => e._tag === "ItemUpserted")).toMatchObject({ item: { _tag: "Message", text: "the whole answer", streaming: true } })
+        // The droppable `Activity` events gave way; the critical one did not.
+        expect(collector.events.filter((e) => e._tag === "Activity").length).toBeLessThan(60)
+      })))
+    const summary = captured.logs.find((args) => args.some((a) => String(a).includes("events queue summary")))
+    const annotations = summary?.[2] as { dropped?: number } | undefined
+    expect(annotations?.dropped).toBeGreaterThan(0)
+  })
+
+  test("a window snapshot never follows the terminal item of its key (INV-10)", () =>
+    run(Effect.gen(function*() {
+      const h = yield* setup({ script: slowText })
+      yield* h.session.startTurn({ turnId: turnId(1), text: "slow", attachments: [] })
+      yield* h.collector.waitFor((es) => es.some((e) => e._tag === "ItemUpserted" && e.key === "msg_g1:0" && e.item._tag === "Message" && !e.item.streaming), "the terminal item")
+      const forKey = h.collector.events.filter((e) => e._tag === "ItemUpserted" && e.key === "msg_g1:0")
+      expect(forKey.map((e) => (e.item._tag === "Message" ? e.item.streaming : null))).toEqual([true, false])
+      expect(forKey.at(-1)).toMatchObject({ item: { text: "partial answer", streaming: false } })
     })))
 })
