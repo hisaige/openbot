@@ -199,7 +199,12 @@ export const openClaudeSession = Effect.fn("ClaudeSession.open")(function*(
   /** Terminal: emits the pipeline's close events once and ends both queues. */
   const finish = (reason: string, unexpected: boolean) => {
     if (ended) return
-    // One summary per session: the drop count is readable (architecture §2.4).
+    const out = pipeline.close(reason, unexpected)
+    // The terminal events must arrive (INV-8): free room for them when the queue is full.
+    if (Queue.sizeUnsafe(events) + out.events.length > EVENTS_QUEUE_CAPACITY) {
+      overflow.cleared += Effect.runSync(Queue.clear(events)).length
+    }
+    // One summary per session, after the close-path clear so its count is included (architecture §2.4).
     if (overflow.dropped > 0 || overflow.cleared > 0) {
       Effect.runSync(Effect.logWarning("harness-claude: events queue summary", {
         dropped: overflow.dropped,
@@ -207,11 +212,6 @@ export const openClaudeSession = Effect.fn("ClaudeSession.open")(function*(
         overflowed: overflow.overflowed,
         rejectedTag: overflow.rejectedTag,
       }))
-    }
-    const out = pipeline.close(reason, unexpected)
-    // The terminal events must arrive (INV-8): free room for them when the queue is full.
-    if (Queue.sizeUnsafe(events) + out.events.length > EVENTS_QUEUE_CAPACITY) {
-      overflow.cleared += Effect.runSync(Queue.clear(events)).length
     }
     emit(out.events, "lifecycle")
     settle(out.settled)
