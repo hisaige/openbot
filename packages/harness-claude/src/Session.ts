@@ -46,6 +46,15 @@ export const FLUSH_TICK_MS = 100
  */
 export type EventOrigin = "flush" | "reader" | "lifecycle"
 
+/**
+ * The one droppable criterion (architecture §2.4, INV-11), a named pure function so the criterion
+ * itself is testable without a session. Only a flush *snapshot* (`flush` + `ItemUpserted`) or an
+ * `Activity` may be dropped; a non-`ItemUpserted` event from the flush path (e.g. a `TurnStarted`
+ * that a future `flushDue()` might produce) stays critical — the criterion must not lean on INV-1.
+ */
+export const droppableBy = (origin: EventOrigin, event: HarnessEvent): boolean =>
+  (origin === "flush" && event._tag === "ItemUpserted") || event._tag === "Activity"
+
 /** Everything a session needs besides `OpenSessionInput` (resolved by the driver). */
 export interface SessionDeps {
   readonly query: ClaudeQueryFunction
@@ -144,18 +153,24 @@ export const openClaudeSession = Effect.fn("ClaudeSession.open")(function*(
   const closeController = new AbortController()
   let ended = false
   let stderrTail = ""
-  /** Overflow bookkeeping (architecture §2.4): dropped, cleared and the one-shot guard. */
-  const overflow = { dropped: 0, cleared: 0, handled: false }
+  /** Overflow bookkeeping (architecture §4): dropped, cleared, overflowed, rejectedTag and the one-shot guard. */
+  const overflow: {
+    dropped: number
+    cleared: number
+    overflowed: boolean
+    rejectedTag: HarnessEvent["_tag"] | undefined
+    handled: boolean
+  } = { dropped: 0, cleared: 0, overflowed: false, rejectedTag: undefined, handled: false }
 
   /**
    * Enqueues `batch`, graded by origin (architecture §2.4, INV-11).
-   * Droppable ⇔ `origin === "flush"` or the event is an `Activity`; never by shape.
+   * Droppable ⇔ `droppableBy(origin, event)` (a flush snapshot or an `Activity`), never by shape.
    * A critical event is never dropped: it is queued, or it starts the overflow protocol.
    */
   const emit = (batch: ReadonlyArray<HarnessEvent>, origin: EventOrigin) => {
     if (ended) return
     for (const event of batch) {
-      if (origin === "flush" || event._tag === "Activity") {
+      if (droppableBy(origin, event)) {
         // Droppable: the room for the critical events stays free.
         if (Queue.sizeUnsafe(events) >= EVENTS_QUEUE_CAPACITY - CRITICAL_RESERVE) {
           overflow.dropped += 1
@@ -189,7 +204,8 @@ export const openClaudeSession = Effect.fn("ClaudeSession.open")(function*(
       Effect.runSync(Effect.logWarning("harness-claude: events queue summary", {
         dropped: overflow.dropped,
         cleared: overflow.cleared,
-        overflowed: overflow.handled,
+        overflowed: overflow.overflowed,
+        rejectedTag: overflow.rejectedTag,
       }))
     }
     const out = pipeline.close(reason, unexpected)
@@ -214,6 +230,8 @@ export const openClaudeSession = Effect.fn("ClaudeSession.open")(function*(
   const handleOverflow = (rejected: HarnessEvent) => {
     if (overflow.handled) return
     overflow.handled = true
+    overflow.overflowed = true
+    overflow.rejectedTag = rejected._tag
     const reason = `events queue overflow (capacity=${EVENTS_QUEUE_CAPACITY})`
     Effect.runSync(Effect.logWarning("harness-claude: events queue overflow", {
       reason,

@@ -8,7 +8,7 @@ import { existsSync, readdirSync, readFileSync, realpathSync } from "node:fs"
 import { join } from "node:path"
 import { type ClaudeHarnessConfig, ClaudeHarnessLive, makeClaudeDriver } from "../src/Driver.ts"
 import type { ClaudeQueryFunction } from "../src/sdk.ts"
-import { type SessionDeps, TASK_BASH_DEFAULT_TIMEOUT_MS, TASK_BASH_MAX_TIMEOUT_MS } from "../src/Session.ts"
+import { droppableBy, type SessionDeps, TASK_BASH_DEFAULT_TIMEOUT_MS, TASK_BASH_MAX_TIMEOUT_MS } from "../src/Session.ts"
 import { supportsProcessGroups } from "../src/spawn.ts"
 import {
   cliFrames,
@@ -1046,8 +1046,14 @@ describe("bounded event queue (architecture §2.4)", () => {
       const h = yield* setup({ script: slowText })
       yield* h.session.startTurn({ turnId: turnId(1), text: "slow", attachments: [] })
       yield* h.collector.waitFor((es) => es.some((e) => e._tag === "ItemUpserted" && e.key === "msg_g1:0" && e.item._tag === "Message" && !e.item.streaming), "the terminal item")
-      const forKey = h.collector.events.filter((e) => e._tag === "ItemUpserted" && e.key === "msg_g1:0")
+      const forKey = h.collector.events.filter((e): e is Extract<HarnessEvent, { _tag: "ItemUpserted" }> => e._tag === "ItemUpserted" && e.key === "msg_g1:0")
       expect(forKey.map((e) => (e.item._tag === "Message" ? e.item.streaming : null))).toEqual([true, false])
       expect(forKey.at(-1)).toMatchObject({ item: { text: "partial answer", streaming: false } })
     })))
+
+  test("droppableBy: the origin and the tag decide, never the item's shape (INV-11)", () => {
+    const upsert: HarnessEvent = { _tag: "ItemUpserted", turnId: turnId(1), key: "k", item: { _tag: "Message", role: "bot", text: "t", streaming: true } }
+    expect([droppableBy("flush", upsert), droppableBy("reader", upsert)]).toEqual([true, false])
+    expect([droppableBy("flush", { _tag: "TurnStarted", turnId: turnId(1) }), droppableBy("lifecycle", { _tag: "SessionClosed", reason: "done" }), droppableBy("reader", { _tag: "Activity", label: "Typing…" })]).toEqual([false, false, true])
+  })
 })
