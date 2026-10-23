@@ -16,6 +16,9 @@ BRAIN_ENTRY="/root/ai/openbot/apps/server/src/main.ts"
 BUN="/root/.bun/bin/bun"
 
 # Claude Code variables whose value is model/backend config: settings.json is the only authority.
+# Keep this list in step with INHERITED_CLAUDE_CODE_VARS in packages/harness-claude/src/config.ts:
+# the brain's cleanEnv only lets these through to a bot's CLI, so a variable the launcher exports
+# but cleanEnv drops would silently do nothing.
 MANAGED_CLAUDE_CODE_VARS=(
   CLAUDE_CODE_SUBAGENT_MODEL
   CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL
@@ -23,10 +26,11 @@ MANAGED_CLAUDE_CODE_VARS=(
   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
   CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION
 )
+MANAGED_CLAUDE_CODE_VAR_LIST=$(IFS=,; echo "${MANAGED_CLAUDE_CODE_VARS[*]}")
 
 # Reads settings.json `env` and prints `export K=V` lines for the managed variables.
 model_env() {
-  python3 - "$SETTINGS" <<'PY'
+  python3 - "$SETTINGS" "$MANAGED_CLAUDE_CODE_VAR_LIST" <<'PY'
 import json, shlex, sys
 
 try:
@@ -37,15 +41,7 @@ except Exception as exc:  # missing or malformed: keep the inherited env rather 
           file=sys.stderr)
     raise SystemExit
 
-managed = (
-    "ANTHROPIC_AUTH_TOKEN",
-    "ANTHROPIC_BASE_URL",
-    "CLAUDE_CODE_SUBAGENT_MODEL",
-    "CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL",
-    "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
-    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
-    "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION",
-)
+managed = tuple(sys.argv[2].split(","))
 for key in sorted(env):
     if key.startswith("ANTHROPIC_") or key in managed:
         print(f"export {key}={shlex.quote(str(env[key]))}")

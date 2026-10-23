@@ -44,11 +44,25 @@ const EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"])
 export type Env = Readonly<Record<string, string | undefined>>
 
 /**
+ * `CLAUDE_CODE_*` variables a bot inherits: model/backend configuration the owner set for this
+ * machine, so a bot follows the same aliases, context window and sub-agent model as the owner's
+ * Claude Code (`scripts/openbot-launch.sh` manages exactly this list).
+ */
+export const INHERITED_CLAUDE_CODE_VARS: ReadonlyArray<string> = [
+  "CLAUDE_CODE_SUBAGENT_MODEL",
+  "CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL",
+  "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+  "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+  "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION",
+]
+
+/**
  * Builds the CLI environment (sdk-claude.md §8, §21.3 rule 7). `Options.env` REPLACES the child
  * environment, so start from the host's. Variables injected by a parent Claude Code process
  * (`CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`, session/IDE hooks …) are dropped so a dev brain started
  * from inside Claude Code does not confuse the child; credential/backend choices the user made
- * (`CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CODE_USE_*`, `ANTHROPIC_*`) and `CLAUDE_CONFIG_DIR` are kept.
+ * (`CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CODE_USE_*`, `ANTHROPIC_*`), the model configuration in
+ * `INHERITED_CLAUDE_CODE_VARS`, and `CLAUDE_CONFIG_DIR` are kept.
  */
 export const cleanEnv = (
   base: Env,
@@ -61,7 +75,7 @@ export const cleanEnv = (
     if (key === "CLAUDECODE") continue
     if (
       key.startsWith("CLAUDE_CODE_") && key !== "CLAUDE_CODE_OAUTH_TOKEN" && !key.startsWith("CLAUDE_CODE_USE_") &&
-      key !== "CLAUDE_CODE_GIT_BASH_PATH"
+      key !== "CLAUDE_CODE_GIT_BASH_PATH" && !INHERITED_CLAUDE_CODE_VARS.includes(key)
     ) continue
     if (key === "CLAUDE_AGENT_SDK_VERSION" || key === "CLAUDE_AGENT_SDK_CLIENT_APP") continue
     env[key] = value

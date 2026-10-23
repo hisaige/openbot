@@ -12,7 +12,7 @@ export {
   makeClaudeDriver,
   resolveExecutable,
 } from "./Driver.ts"
-export { cleanEnv, DISALLOWED_NATIVE_TOOLS, PREAPPROVED_TOOLS } from "./config.ts"
+export { cleanEnv, DISALLOWED_NATIVE_TOOLS, INHERITED_CLAUDE_CODE_VARS, PREAPPROVED_TOOLS } from "./config.ts"
 export { ClaudeEventPipeline, type PipelineOptions, type PipelineOutput } from "./normalize.ts"
 export { parseAccountInfo, parseAuth, parseInitialization, parseModels } from "./probe.ts"
 export {
