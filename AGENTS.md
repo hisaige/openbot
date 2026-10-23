@@ -25,3 +25,31 @@ Read first: `docs/decisions.md` (binding), `docs/architecture.md`, `docs/plan.md
 - **Tests.** `bun test` runs against fakes and recorded fixtures. Live harness tests are gated by `OPENBOT_LIVE_CLAUDE`, `OPENBOT_LIVE_CODEX` and `OPENBOT_LIVE_OPENCODE`, and must stay trivially cheap.
 - **Per-package checks:** `bunx tsc --noEmit -p packages/<name>` and `bun test packages/<name>`. The root `bunfig.toml` ignores `vendor/`; never run a bare `bun test` that crawls `vendor/`.
 - **Don't commit** unless the user asks.
+
+## Branches
+
+- **`main` is never touched during development.** No commits, no merges, no rebases, no
+  cherry-picks. It is the upstream branch: read it, merge from it, never write to it.
+- **`hisaige` is the working branch.** All iteration happens here.
+- **Every other branch (feature branches, and the branches of every worktree) merges back into
+  `hisaige`** when its work is done. A branch that is not merged into `hisaige` is unfinished work.
+- **Delete a branch or worktree once it is merged into `hisaige`.** After the work is merged, the
+  branch and its worktree are removed, so the repo stays lean. Only `hisaige` and `main` are kept in
+  the end; when the feature is complete, everything else is gone.
+  - Check before deleting: `git merge-base --is-ancestor <sha> hisaige` must succeed, and
+    `git status --porcelain` in the worktree must be empty. Unmerged or dirty work is never deleted.
+
+## Deploying
+
+- **After every update of `hisaige`, the service is redeployed.** A change that is not deployed is
+  not live.
+- The brain runs on this machine under **pm2** (the `openbot` process): `pm2 restart openbot`
+  (or `pm2 reload openbot` to restart only the app process). The process is started from
+  `apps/server` with `src/main.ts --public-origin https://openbot.devcloud.woa.com`.
+- `pm2 list` shows the process; `~/.pm2/logs/openbot-out.log` and `openbot-error.log` hold its
+  output. A restart must be followed by a check that the brain came back up ("OpenBot started" in
+  the log).
+- `bun run deploy` (scripts/deploy.ts) is the other path: it ships the working tree to a release
+  directory, drains the running brain (so queued and running work survives), backs the database up
+  and starts the new release. It is the right tool when the brain runs elsewhere or as a systemd
+  service; under pm2 on this machine, a pm2 restart is enough.
