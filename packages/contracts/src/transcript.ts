@@ -204,6 +204,13 @@ export const ConversationEventMembers = [
   Schema.Struct({ type: Schema.Literal("request-elsewhere"), botId: BotId, requestId: RequestId, conversationId: ConversationId }),
   /** New session / compact (D0.4). */
   Schema.Struct({ type: Schema.Literal("session-changed"), botId: BotId, action: Schema.Literals(["new-session", "compacted"]) }),
+  /** A voice call with the Bot (experiment): how long it was and what was said ("Voice chat · 00:31"). */
+  Schema.Struct({
+    type: Schema.Literal("voice-call"),
+    botId: BotId,
+    durationMs: NonNegativeInt,
+    lines: Schema.Array(Schema.Struct({ who: Schema.Literals(["you", "bot"]), text: Schema.String })),
+  }),
 ] as const
 const eventFallback = withUnknownFallback({ members: ConversationEventMembers, tag: "type", keep: {} })
 export const ConversationEvent = eventFallback.schema
@@ -262,6 +269,8 @@ export const Turn = Schema.Struct({
   usage: Schema.optionalKey(Usage),
   stopReason: Schema.optionalKey(Schema.String),
   failure: Schema.optionalKey(TurnFailure),
+  /** Work handed over on a voice call (experiment): told on the call, so it stays out of the chat. */
+  voice: Schema.optionalKey(Schema.Boolean),
 })
 export type Turn = typeof Turn.Type
 

@@ -49,7 +49,7 @@ import {
 } from "../../ports/repos.ts"
 import { LiveHub } from "../../ports/services.ts"
 import { rosterTasks } from "./BackgroundTasks.ts"
-import { summarize } from "./internal/summary.ts"
+import { summarize, visiblePage } from "./internal/summary.ts"
 import { orDie, required } from "./internal/util.ts"
 
 type ResetReason = "new-session" | "rollback" | "rebuild"
@@ -157,7 +157,6 @@ export const makeLiveHubLayer = (
     const windowOptions = { ...DEFAULT_PUBLISH_WINDOW, ...options?.publishWindow }
     const log = yield* ReplicaLog
     const conversations = yield* ConversationRepo
-    const entries = yield* EntryRepo
     const requests = yield* RequestRepo
     const turns = yield* TurnRepo
     const bots = yield* BotRepo
@@ -165,7 +164,7 @@ export const makeLiveHubLayer = (
     const taskRepo = yield* TaskRepo
     const directory = yield* NodeDirectory
     const ids = yield* IdGen
-    const repos = yield* Effect.context<EntryRepo | RequestRepo | SettingsRepo>()
+    const repos = yield* Effect.context<EntryRepo | RequestRepo | SettingsRepo | TurnRepo>()
 
     const lock = yield* Semaphore.make(1)
     const heads = new Map<ReplicaKey, StreamCursor>()
@@ -266,7 +265,7 @@ export const makeLiveHubLayer = (
       Effect.gen(function*() {
         const conversation = yield* required(conversations.get(conversationId), "conversation", conversationId)
         const limit = Math.min(Math.max(1, Math.floor(tailLimit ?? SNAPSHOT_TAIL_ENTRIES)), MAX_TAIL_LIMIT)
-        const page = yield* orDie(entries.page({ conversationId, limit }))
+        const page = yield* orDie(Effect.provide(visiblePage({ conversationId, limit }), repos))
         const window = page.entries.filter((e) => e.kind !== "unknown")
         const referenced = new Set<RequestId>()
         for (const entry of window) {

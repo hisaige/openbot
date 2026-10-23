@@ -19,7 +19,7 @@ import { IdGen } from "../../ports/IdGen.ts"
 import { BotRepo, ConversationRepo, EntryRepo, type EntryPosition, ReplicaLog, RequestRepo, SettingsRepo, TurnRepo } from "../../ports/repos.ts"
 import { ConversationService, type EntryDraft, LiveHub } from "../../ports/services.ts"
 import { ConversationStore, ConversationStoreLive } from "./internal/ConversationStore.ts"
-import { summarize } from "./internal/summary.ts"
+import { summarize, visiblePage } from "./internal/summary.ts"
 import { compact, isHousekeeping, orDie, required } from "./internal/util.ts"
 
 /** Upper bound for `conversations.history` and `conversations.exchange` pages. */
@@ -83,7 +83,13 @@ export const ConversationServiceLive: Layer.Layer<
     const bots = yield* BotRepo
     const settings = yield* SettingsRepo
     const ids = yield* IdGen
-    const repos = yield* Effect.context<EntryRepo | RequestRepo>()
+    const repos = yield* Effect.context<EntryRepo | RequestRepo | TurnRepo>()
+    const turnRepo = yield* TurnRepo
+    /** Part of work handed over on a voice call (it does not move the conversation). */
+    const inVoiceTurn = (entry: KnownTranscriptEntry) =>
+      entry.turnId === undefined
+        ? Effect.succeed(false)
+        : turnRepo.get(entry.turnId).pipe(Effect.map((t) => t._tag === "Some" && t.value.voice === true), Effect.orElseSucceed(() => false))
 
     // ------------------------------------------------------------------ transcript writes
 
@@ -100,7 +106,7 @@ export const ConversationServiceLive: Layer.Layer<
       const outcome = yield* orDie(entries.upsert(entry))
       if (!outcome.applied) return outcome.current
       yield* publishEntry(outcome.value)
-      if (touchesConversation(entry)) yield* Effect.ignore(store.update(conversation.id, (c) => bumpForEntry(c, entry)))
+      if (touchesConversation(entry) && !(yield* inVoiceTurn(entry))) yield* Effect.ignore(store.update(conversation.id, (c) => bumpForEntry(c, entry)))
       return outcome.value
     })
 
@@ -292,11 +298,11 @@ export const ConversationServiceLive: Layer.Layer<
       if (!Number.isInteger(input.limit) || input.limit < 1 || input.limit > MAX_HISTORY_LIMIT) {
         return yield* new InvalidInput({ message: `limit must be between 1 and ${MAX_HISTORY_LIMIT}.` })
       }
-      const page = yield* orDie(entries.page({
+      const page = yield* orDie(Effect.provide(visiblePage({
         conversationId: input.conversationId,
         before: input.beforeCursor === "" ? undefined : input.beforeCursor,
         limit: input.limit,
-      }))
+      }), repos))
       return compact<TranscriptPage>({
         entries: page.entries.filter((e) => e.kind !== "unknown"),
         hasMoreBefore: page.hasMoreBefore,

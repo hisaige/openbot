@@ -3,7 +3,7 @@
 // for a newline, Stop while the bot works (turns.interrupt) and the context ring. On a phone it is
 // Grok iOS's composer: a separate round + beside the pill field, 16 px text (no iOS focus zoom),
 // Return inserts a newline and the send button sends; no autofocus (it would pop the keyboard).
-import { ArrowUp, Paperclip, Plus, Square, X } from "lucide-react"
+import { ArrowUp, AudioLines, Paperclip, Plus, Square, X } from "lucide-react"
 import { type KeyboardEvent, type ReactNode, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
 import { useAtomSet } from "@effect/atom-react"
 import { Exit } from "effect"
@@ -46,6 +46,8 @@ export interface ComposerProps {
   readonly context?: ContextRingProps | undefined
   readonly disabled?: boolean
   readonly autoFocus?: boolean
+  /** Starts a voice call with this chat's Bot (experiment): shown instead of Send while the box is empty. */
+  readonly onCall?: (() => void) | undefined
   readonly className?: string
 }
 
@@ -431,7 +433,9 @@ export function Composer(props: ComposerProps): ReactNode {
           {working && (
             <IconButton icon={Square} label="Stop" title="Stop the Bot" size={phone ? 36 : 28} variant={text.trim() ? "secondary" : "primary"} iconSize="xs" onClick={props.onStop} className="[&_svg]:fill-current" />
           )}
-          {(!working || text.trim() || ready.length > 0) && (
+          {props.onCall !== undefined && !working && !dictating && text.trim() === "" && uploads.length === 0 ? (
+            <IconButton icon={AudioLines} label="Start a voice call" size={phone ? 36 : 28} variant="accent" onClick={props.onCall} data-testid="voice-call-button" />
+          ) : (!working || text.trim() || ready.length > 0) && (
             <IconButton icon={ArrowUp} label="Send" size={phone ? 36 : 28} variant="accent" aria-disabled={!canSend || undefined} className={cn(!canSend && "cursor-default", phone && !canSend && "opacity-40")} onClick={() => void submit()} />
           )}
         </div>

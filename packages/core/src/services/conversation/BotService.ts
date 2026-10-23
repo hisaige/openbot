@@ -9,6 +9,7 @@
 import type { Bot, BotAutonomy, BotCreateInput, BotHarness, BotId, BotPatch, Conversation, NodeId, Section, SectionId, SidebarItemRef, SidebarPlace } from "@openbot/contracts"
 import {
   Conflict,
+  kokoroVoice,
   defaultBotAvatar,
   InvalidInput,
   LOCAL_NODE_ID,
@@ -277,6 +278,12 @@ export const BotServiceLive: Layer.Layer<
       }
       if (patch.hidden !== undefined) next = { ...next, hidden: patch.hidden }
       if (patch.notify !== undefined) next = { ...next, notify: patch.notify }
+      if (patch.voice !== undefined) {
+        const { voice: _drop, ...rest } = next
+        if (patch.voice === null) next = rest
+        else if (kokoroVoice(patch.voice) === undefined) return yield* new InvalidInput({ message: `There is no voice called "${patch.voice}".` })
+        else next = { ...rest, voice: patch.voice }
+      }
       if (patch.autonomy !== undefined) next = { ...next, autonomy: patch.autonomy }
       if (patch.projectFolders !== undefined) {
         const cleaned = cleanProjectFolders(patch.projectFolders)

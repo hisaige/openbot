@@ -8,6 +8,7 @@ import { MAX_TASK_RESTARTS } from "@openbot/contracts"
 import { Deferred, Effect, Option } from "effect"
 import {
   ApprovalService,
+  CallPresence,
   BackgroundTasks,
   BootRecovery,
   BotRepo,
@@ -22,6 +23,7 @@ import { McpBindingIssuerFake, runTest } from "../../src/testing/index.ts"
 import { renderTaskTurn, TASK_CONTEXT_BYTES, TASK_CONTEXT_MESSAGES } from "../../src/services/conversation/BackgroundTasks.ts"
 import {
   appLayer,
+  turnsOf,
   collect,
   createBot,
   eventually,
@@ -190,6 +192,42 @@ describe("background tasks", () => {
     expect(statuses[0]).toBe("queued")
     expect(statuses).toContain("running")
     expect(statuses.at(-1)).toBe("succeeded")
+  })
+
+  test("work started on a voice call reports back on the call while it lasts, and to the chat after", async () => {
+    const out = await runTest(
+      Effect.gen(function*() {
+        const driver = yield* TestDriver
+        const orchestrator = yield* Orchestrator
+        const presence = yield* CallPresence
+        const ada = yield* createBot("Ada")
+        const dm = ada.directConversationId
+        const gates = yield* makeGates("inbox sweep", "calendar sweep")
+        yield* driver.setBehavior(ada.id, behavior(yield* BackgroundTasks, gates))
+        presence.enter(ada.id)
+        // on the call: "start …" arrives as a voice delivery
+        for (const title of ["inbox sweep", "calendar sweep"]) {
+          const receipt = yield* orchestrator.deliver({ conversationId: dm, botId: ada.id, kind: "user-message", text: `start ${title}`, urgency: "urgent", voice: true })
+          yield* orchestrator.awaitDelivery(receipt.deliveryId)
+        }
+        const [inbox, calendar] = [...(yield* tasksOf(ada.id))].sort((a, b) => a.title.localeCompare(b.title)).reverse()
+        // the inbox finishes while the call is on: its report is a voice turn
+        yield* Deferred.succeed(gates.get("inbox sweep")!, undefined)
+        yield* eventually(Effect.map(statusOf(inbox!.id), (s) => s === "succeeded"), "inbox done")
+        yield* settled(dm, 3)
+        // the owner hangs up; the calendar finishes after: a normal turn, in the chat
+        presence.leave(ada.id)
+        yield* Deferred.succeed(gates.get("calendar sweep")!, undefined)
+        yield* eventually(Effect.map(statusOf(calendar!.id), (s) => s === "succeeded"), "calendar done")
+        yield* settled(dm, 4)
+        return { turns: yield* turnsOf(dm), handles: yield* driver.turns }
+      }),
+      appLayer(),
+    )
+    const reports = out.handles.filter((h) => h.taskId === undefined && h.input.text.startsWith("[Result of "))
+    const voiceOf = (text: string) => out.turns.find((t) => t.id === reports.find((r) => r.input.text.includes(text))?.turnId)?.voice
+    expect(voiceOf("inbox sweep")).toBe(true)
+    expect(voiceOf("calendar sweep")).toBeUndefined()
   })
 
   test("cancel stops only that task; the owner's stop is reported, the bot's own is not", async () => {

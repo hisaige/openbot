@@ -41,6 +41,7 @@ import { OPENBOT_VERSION, ServerConfig } from "./config.ts"
 import { Hark } from "./hark.ts"
 import { HarnessProfiles } from "./profiles.ts"
 import { SpeechToText } from "./stt/service.ts"
+import { VoiceCalls } from "./voice/service.ts"
 
 const INTERNAL_MESSAGE = "Something went wrong on the brain; the details are in its log."
 
@@ -148,6 +149,7 @@ export const RpcHandlersLive = OpenBotRpcs.toLayer(Effect.gen(function*() {
   const slack = yield* SlackConnector
   const slackDrafts = yield* SlackService
   const speech = yield* SpeechToText
+  const voice = yield* VoiceCalls
   const hark = yield* Hark
   const ownerFallback = defaultOwnerName()
 
@@ -309,6 +311,10 @@ export const RpcHandlersLive = OpenBotRpcs.toLayer(Effect.gen(function*() {
     "stt.append": ({ sessionId, pcmBase64 }) => edge("stt.append", withPcm(pcmBase64, (pcm) => speech.append(sessionId, pcm))),
     "stt.finish": ({ sessionId, pcmBase64 }) => edge("stt.finish", withPcm(pcmBase64, (pcm) => speech.finish(sessionId, pcm))),
     "stt.discard": ({ sessionId }) => edge("stt.discard", speech.discard(sessionId)),
+    "voice.status": () => edge("voice.status", voice.status),
+    "voice.install": () => edge("voice.install", voice.install),
+    "voice.remove": () => edge("voice.remove", voice.remove),
+    "voice.preview": ({ voice: id, text }) => edge("voice.preview", voice.preview(id, text)),
 
     // ---------------------------------------------------------------- sidebar (drag and drop)
     "sidebar.arrange": (input) => edge("sidebar.arrange", bots.arrangeSidebar(input)),

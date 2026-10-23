@@ -21,7 +21,7 @@ import { RpcClient, type RpcClientError, RpcSerialization } from "effect/rpc"
 import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { type Browser, type BrowserContext, chromium, type Page } from "playwright-core"
+import { type Browser, type BrowserContext, type BrowserContextOptions, chromium, type Page } from "playwright-core"
 
 export const chromiumPath = process.env.OPENBOT_CHROMIUM ?? "/usr/bin/chromium"
 export const hasChromium = existsSync(chromiumPath)
@@ -73,9 +73,18 @@ const waitFor = async (sink: { text: string }, pattern: RegExp, timeoutMs: numbe
   throw new Error(`${what} did not show up within ${timeoutMs} ms:\n${sink.text.slice(-4000)}`)
 }
 
-/** `env`: extra variables for the brain, e.g. `OPENBOT_SKILLS_SH_URL` (a fake skills.sh). */
-export const startBrain = async (options?: { readonly harnesses?: string; readonly args?: ReadonlyArray<string>; readonly env?: Record<string, string> }): Promise<Brain> => {
+/**
+ * `env`: extra variables for the brain, e.g. `OPENBOT_SKILLS_SH_URL` (a fake skills.sh). `prepare`
+ * runs on the empty data folder before the brain starts (e.g. links to installed models).
+ */
+export const startBrain = async (options?: {
+  readonly harnesses?: string
+  readonly args?: ReadonlyArray<string>
+  readonly env?: Record<string, string>
+  readonly prepare?: (dataDir: string) => void
+}): Promise<Brain> => {
   const dataDir = mkdtempSync(join(tmpdir(), "openbot-e2e-brain-"))
+  options?.prepare?.(dataDir)
   const child = Bun.spawn(
     [process.execPath, serverMain, "--data-dir", dataDir, "--port", "0", "--harness", options?.harnesses ?? "fake", ...(options?.args ?? [])],
     { cwd: repoRoot, stdout: "pipe", stderr: "pipe", env: childEnv(options?.env) },
@@ -104,7 +113,7 @@ export const startBrain = async (options?: { readonly harnesses?: string; readon
 
 // ---------------------------------------------------------------------------------- browser
 
-export const launchBrowser = (): Promise<Browser> => chromium.launch({ executablePath: chromiumPath })
+export const launchBrowser = (args?: ReadonlyArray<string>): Promise<Browser> => chromium.launch({ executablePath: chromiumPath, ...(args === undefined ? {} : { args: [...args] }) })
 
 export interface AppPage {
   readonly page: Page
@@ -114,10 +123,14 @@ export interface AppPage {
   readonly shot: (name: string) => Promise<void>
 }
 
-/** Opens the app logged in (login URL → cookie → `/`). */
-export const openApp = async (browser: Browser, brain: Brain, options?: { readonly theme?: "dark" | "light"; readonly route?: string }): Promise<AppPage> => {
+/** Opens the app logged in (login URL → cookie → `/`); `context` sets the window (a phone's, say). */
+export const openApp = async (
+  browser: Browser,
+  brain: Brain,
+  options?: { readonly theme?: "dark" | "light"; readonly route?: string; readonly context?: BrowserContextOptions },
+): Promise<AppPage> => {
   const theme = options?.theme ?? "dark"
-  const context = await browser.newContext({ viewport: { width: 1440, height: 900 }, deviceScaleFactor: 1, colorScheme: theme })
+  const context = await browser.newContext({ viewport: { width: 1440, height: 900 }, deviceScaleFactor: 1, colorScheme: theme, ...options?.context })
   const page = await context.newPage()
   page.setDefaultTimeout(15_000)
   const errors: Array<string> = []

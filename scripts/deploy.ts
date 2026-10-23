@@ -2,7 +2,12 @@
 /**
  * `bun run deploy`: ships the working tree to the live OpenBot without losing the bots' work.
  *
- *   bun run deploy [--grace 3m] [--now] [--data-dir <dir>] [--releases <dir>] [-- <server args>]
+ *   bun run deploy [--grace 3m] [--now] [--to <ssh host> | --local] [--data-dir <dir>] [--releases <dir>] [-- <server args>]
+ *
+ * The brain on another machine: `--to` (or `{ "host": "<ssh host>" }` in this machine's
+ * `~/.config/openbot/deploy.json`) copies the working tree to `<host>:~/.local/share/openbot-staging`
+ * (only what changed) and runs this script there, which does the steps below on that machine.
+ * `--local` deploys on this machine anyway.
  *
  * 1. Copies the repo into a new release, `<releases>/<id>` (unchanged files are hard links to the
  *    previous release, so it is quick and small), and checks that it loads (`main.ts --version`).
@@ -16,6 +21,10 @@
  *    deploy's) and waits for "OpenBot started". If it does not start, the previous release is started
  *    again.
  * 5. Points `<releases>/current` at it and keeps the newest releases.
+ *
+ * Where the brain runs as the systemd user service `openbot` (scripts/openbot.service: it starts on
+ * boot and again after a crash), it is started and stopped through systemd; the service runs
+ * `<releases>/current` with the arguments in `<data>/brain.env`.
  *
  * Every `CLAUDE*` variable is removed from the brain's environment (a brain started from inside a
  * Claude Code session must not inherit its account).
@@ -50,9 +59,22 @@ const parseDuration = (text: string): number => {
 }
 
 const argv = process.argv.slice(2)
-const split = argv.indexOf("--")
-const own = split < 0 ? argv : argv.slice(0, split)
-const passed = split < 0 ? undefined : argv.slice(split + 1)
+const VALUE_OPTIONS = ["--grace", "--to", "--data-dir", "--releases", "--release-id"]
+const FLAG_OPTIONS = ["--now", "--local"]
+/** Where the server arguments start: after `--`, or at the first argument that is not this script's
+ * own (Bun drops a leading `--`, so `bun run deploy -- --port 7420` arrives as `--port 7420`). */
+const serverArgsAt = (): number => {
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]!
+    if (arg === "--") return i
+    if (VALUE_OPTIONS.includes(arg)) i++
+    else if (!FLAG_OPTIONS.includes(arg)) return i
+  }
+  return argv.length
+}
+const split = serverArgsAt()
+const own = argv.slice(0, split)
+const passed = split === argv.length ? undefined : argv.slice(argv[split] === "--" ? split + 1 : split)
 const option = (name: string) => {
   const at = own.indexOf(name)
   return at < 0 ? undefined : own[at + 1]
@@ -62,6 +84,19 @@ const dataDir = resolve(option("--data-dir") ?? join(homedir(), ".local/share/op
 const releases = resolve(option("--releases") ?? join(homedir(), ".local/share/openbot-releases"))
 const graceMs = parseDuration(option("--grace") ?? "3m")
 const now = own.includes("--now")
+
+/** The machine the brain runs on, when it is not this one. */
+const deployHost = (): string | undefined => {
+  if (own.includes("--local")) return undefined
+  const flag = option("--to")
+  if (flag !== undefined) return flag
+  const file = join(homedir(), ".config/openbot/deploy.json")
+  return existsSync(file) ? (JSON.parse(readFileSync(file, "utf8")) as { host?: string }).host : undefined
+}
+
+const SERVICE = "openbot.service"
+/** The brain runs as the systemd user service: deploys start and stop it through systemd. */
+const asService = existsSync(join(homedir(), ".config/systemd/user", SERVICE))
 
 // ---------------------------------------------------------------------------- the running brain
 
@@ -125,6 +160,8 @@ const run = (cmd: ReadonlyArray<string>, cwd = repo) => {
 }
 
 const releaseId = () => {
+  const given = option("--release-id")
+  if (given !== undefined) return given
   const stamp = new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15)
   const sha = run(["git", "rev-parse", "--short", "HEAD"]).out
   const dirty = run(["git", "status", "--porcelain"]).out !== ""
@@ -197,14 +234,27 @@ const stopBrain = async (brain: Brain) => {
     }
     await sleep(500)
   }
+  // a brain that ended badly is due to be restarted by systemd: it must not come back
+  if (asService) systemctl("stop", SERVICE)
   say("the old brain stopped")
 }
 
-const startBrain = async (cwd: string, args: ReadonlyArray<string>): Promise<boolean> => {
-  mkdirSync(dataDir, { recursive: true, mode: 0o700 })
-  const logPath = join(dataDir, "server.log")
-  const offset = existsSync(logPath) ? statSync(logPath).size : 0
-  const log = openSync(logPath, "a")
+const systemctl = (...args: ReadonlyArray<string>) => run(["systemctl", "--user", ...args])
+
+/** Starts the brain: the service on `<releases>/current` (pointed at `cwd`), else a detached process. */
+const launch = async (cwd: string, args: ReadonlyArray<string>, log: number): Promise<{ readonly ended: () => boolean; readonly stop: () => Promise<void> } | undefined> => {
+  if (asService) {
+    if (args.some((arg) => /\s/.test(arg))) fail(`server arguments with spaces cannot go in brain.env: ${args.join(" ")}`)
+    await Bun.write(join(dataDir, "brain.env"), `OPENBOT_ARGS=${args.join(" ")}\n`)
+    pointCurrent(cwd)
+    const started = systemctl("restart", SERVICE)
+    if (!started.ok) {
+      console.error(started.out)
+      return undefined
+    }
+    const stop = async () => void systemctl("stop", SERVICE)
+    return { ended: () => !systemctl("is-active", "--quiet", SERVICE).ok, stop }
+  }
   const child = Bun.spawn(["setsid", "bun", "apps/server/src/main.ts", ...args], {
     cwd,
     env: brainEnv(),
@@ -213,24 +263,37 @@ const startBrain = async (cwd: string, args: ReadonlyArray<string>): Promise<boo
     stderr: log,
   })
   child.unref()
+  const stop = async () => {
+    // setsid made it a process-group leader: its harness children go with it
+    try {
+      process.kill(-child.pid, "SIGTERM")
+    } catch {}
+    for (let i = 0; i < 40 && alive(child.pid); i++) await sleep(500)
+    if (alive(child.pid)) process.kill(-child.pid, "SIGKILL")
+  }
+  return { ended: () => child.exitCode !== null, stop }
+}
+
+const startBrain = async (cwd: string, args: ReadonlyArray<string>): Promise<boolean> => {
+  mkdirSync(dataDir, { recursive: true, mode: 0o700 })
+  const logPath = join(dataDir, "server.log")
+  const offset = existsSync(logPath) ? statSync(logPath).size : 0
+  const brain = await launch(cwd, args, openSync(logPath, "a"))
+  if (brain === undefined) return false
   const deadline = Date.now() + STARTUP_TIMEOUT_MS
   while (Date.now() < deadline) {
     await sleep(500)
     // `offset` counts bytes: cut the bytes, not the decoded text (the log is not ASCII)
-    const text = readFileSync(logPath).subarray(offset).toString("utf8")
+    const text = existsSync(logPath) ? readFileSync(logPath).subarray(offset).toString("utf8") : ""
     if (text.includes("OpenBot started")) return true
-    if (text.includes("failed to start") || child.exitCode !== null) {
+    if (text.includes("failed to start") || brain.ended()) {
       console.error(text.split("\n").slice(-20).join("\n"))
+      await brain.stop()
       return false
     }
   }
   say("no \"OpenBot started\" in time: stopping it")
-  // setsid made it a process-group leader: its harness children go with it
-  try {
-    process.kill(-child.pid, "SIGTERM")
-  } catch {}
-  for (let i = 0; i < 40 && alive(child.pid); i++) await sleep(500)
-  if (alive(child.pid)) process.kill(-child.pid, "SIGKILL")
+  await brain.stop()
   return false
 }
 
@@ -271,7 +334,31 @@ const prune = (keep: ReadonlyArray<string>) => {
   }
 }
 
+// ---------------------------------------------------------------------------- another machine
+
+const STAGING = ".local/share/openbot-staging"
+const quote = (arg: string) => `'${arg.replaceAll("'", "'\\''")}'`
+
+/** Copies the working tree to the brain's machine and deploys there (the release is named here: git is not copied). */
+const shipTo = (host: string): never => {
+  const ssh = ["ssh", "-o", "BatchMode=yes"]
+  say(`copying the repo to ${host}`)
+  const copied = run(["rsync", "-az", "--delete", "-e", ssh.join(" "), ...EXCLUDES.flatMap((pattern) => ["--exclude", pattern]), `${repo}/`, `${host}:${STAGING}/`])
+  if (!copied.ok) fail(`copying to ${host} failed:\n${copied.out}`)
+  const forwarded = own.filter((arg, i) => arg !== "--local" && arg !== "--to" && own[i - 1] !== "--to")
+  const command = [
+    `cd ${STAGING} && PATH="$HOME/.bun/bin:$HOME/.local/bin:$PATH" exec bun scripts/deploy.ts --local --release-id ${quote(releaseId())}`,
+    ...forwarded.map(quote),
+    ...(passed === undefined ? [] : ["--", ...passed.map(quote)]),
+  ].join(" ")
+  const remote = Bun.spawnSync([...ssh, host, command], { stdin: "ignore", stdout: "inherit", stderr: "inherit" })
+  process.exit(remote.exitCode ?? 1)
+}
+
 // ---------------------------------------------------------------------------- main
+
+const host = deployHost()
+if (host !== undefined) shipTo(host)
 
 const savedArgsPath = join(dataDir, "deploy.json")
 const brain = runningBrain()

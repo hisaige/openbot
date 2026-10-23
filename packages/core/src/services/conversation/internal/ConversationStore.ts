@@ -52,7 +52,7 @@ export const ConversationStoreLive: Layer.Layer<
     const requests = yield* RequestRepo
     const turns = yield* TurnRepo
     const replicas = yield* ReplicaLog
-    const repos = yield* Effect.context<EntryRepo | RequestRepo>()
+    const repos = yield* Effect.context<EntryRepo | RequestRepo | TurnRepo>()
     const lock = yield* Semaphore.make(1)
     const entryLock = yield* Semaphore.make(1)
     const published = new Map<ConversationId, string>()

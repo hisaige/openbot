@@ -191,6 +191,8 @@ export const layoutTranscript = (input: LayoutInput): ReadonlyArray<Row> => {
   }
 
   for (const entry of input.entries) {
+    // work handed over on a voice call is told on the call, not shown here
+    if (entry.turnId !== undefined && turns.get(entry.turnId)?.voice === true) continue
     if (isFoldedDecision(entry)) {
       // into the turn's steps (no row, no timestamp: bubble groups continue across it)
       if (entry.turnId !== undefined) {

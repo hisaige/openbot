@@ -18,7 +18,7 @@ import type {
   TurnId,
 } from "@openbot/contracts"
 import { Cause, Context, Deferred, Effect, Fiber, Layer, Queue, Ref, Scope, Stream } from "effect"
-import {
+import { CallPresence,
   BotService,
   ConversationService,
   EntryRepo,
@@ -408,6 +408,7 @@ export const appLayer = (options?: AppOptions) => {
     Layer.provideMerge(level2),
     Layer.provideMerge(LiveHubLive),
     Layer.provideMerge(driver),
+    Layer.provideMerge(CallPresence.layer),
     Layer.provideMerge(ports),
   )
 }

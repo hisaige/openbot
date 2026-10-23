@@ -122,7 +122,7 @@ import type {
   Usage,
 } from "@openbot/contracts"
 import type { Invocation, NodeApprovalRequest, NodeApprovalResponse } from "@openbot/node-protocol"
-import { Context, Effect, Option, Stream } from "effect"
+import { Context, Effect, Layer, Option, Stream } from "effect"
 import type { RenderedInstructions } from "./Harness.ts"
 import type { McpClaims } from "./Mcp.ts"
 import type { BootRecoveryReport } from "./Persistence.ts"
@@ -207,6 +207,8 @@ export interface Delivery {
   readonly taskId?: TaskId | undefined
   /** Carried over a restart: the turn it was queued as keeps its id. */
   readonly turnId?: TurnId | undefined
+  /** Handed over on a voice call: its turn is marked `voice` (out of the chat, no notification). */
+  readonly voice?: boolean | undefined
 }
 
 /**
@@ -1043,3 +1045,26 @@ export class AttachmentService extends Context.Service<AttachmentService, {
   /** Contract view (`url` = `/api/attachments/<id>`). */
   readonly get: (attachmentId: AttachmentId) => Effect.Effect<Attachment, NotFound>
 }>()("openbot/core/AttachmentService") {}
+
+/**
+ * Voice calls (experiment): which Bots are on a call right now. Background work started on a call
+ * reports back on it while the call lasts (and to the chat after).
+ */
+export class CallPresence extends Context.Service<CallPresence, {
+  readonly onCall: (botId: BotId) => boolean
+  readonly enter: (botId: BotId) => void
+  readonly leave: (botId: BotId) => void
+}>()("openbot/core/CallPresence") {
+  static readonly layer: Layer.Layer<CallPresence> = Layer.sync(CallPresence, () => {
+    const calls = new Map<BotId, number>()
+    return CallPresence.of({
+      onCall: (botId) => (calls.get(botId) ?? 0) > 0,
+      enter: (botId) => void calls.set(botId, (calls.get(botId) ?? 0) + 1),
+      leave: (botId) => {
+        const left = (calls.get(botId) ?? 0) - 1
+        if (left > 0) calls.set(botId, left)
+        else calls.delete(botId)
+      },
+    })
+  })
+}

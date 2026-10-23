@@ -1,0 +1,30 @@
+# The OpenBot brain as a systemd user service: starts on boot and again after a crash. It runs
+# `<releases>/current` with the arguments in `<data>/brain.env`; scripts/deploy.ts writes both and
+# starts and stops it through systemd once this file is installed.
+#
+#   cp scripts/openbot.service ~/.config/systemd/user/ && systemctl --user daemon-reload
+#   loginctl enable-linger $USER            (as root: start at boot without a login)
+#   bun run deploy -- --port 7420 …         (the first deploy writes brain.env and starts it)
+#   systemctl --user enable openbot
+
+[Unit]
+Description=OpenBot brain
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/share/openbot-releases/current
+EnvironmentFile=%h/.local/share/openbot/brain.env
+Environment=PATH=%h/.bun/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.bun/bin/bun apps/server/src/main.ts $OPENBOT_ARGS
+StandardOutput=append:%h/.local/share/openbot/server.log
+StandardError=append:%h/.local/share/openbot/server.log
+Restart=on-failure
+RestartSec=10
+# stopped or drained, it exits 130 (interrupted): that is a clean stop, not a crash
+SuccessExitStatus=130
+# the brain saves running work when it stops (SIGTERM); it ends its harness processes itself
+KillMode=mixed
+TimeoutStopSec=5min
+
+[Install]
+WantedBy=default.target

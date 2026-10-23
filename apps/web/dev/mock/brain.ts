@@ -60,6 +60,7 @@ import {
   type SkillPreview,
   type SlackStatus,
   type SttStatus,
+  type VoiceCallStatus,
   type HarkStatus,
   type ToolKind,
   type Turn,
@@ -123,6 +124,7 @@ export interface ToolStep {
 }
 
 const STT_DOWNLOAD_BYTES = 500 * 1024 * 1024
+const VOICE_DOWNLOAD_BYTES = 334 * 1024 * 1024
 const STT_DOWNLOAD_STEP_BYTES = 200 * 1024 * 1024
 
 export class MockBrain {
@@ -140,6 +142,7 @@ export class MockBrain {
   /** Slack (D3.4): any `xoxp-` token connects the mock to workspace "Acme". */
   slack: SlackStatus = { connected: false, events: "off" }
   stt: SttStatus = { state: "ready", model: "Parakeet TDT 0.6B v3" }
+  voice: VoiceCallStatus = { state: "absent", model: "Kokoro", downloadBytes: VOICE_DOWNLOAD_BYTES }
   sttFailsAppend = false
   sttFinishDelayMs = 0
   sttDiscards = 0
@@ -1439,6 +1442,18 @@ export class MockBrain {
         sync(() => {
           this.stt = { state: "absent", model: this.stt.model, downloadBytes: STT_DOWNLOAD_BYTES }
           return this.stt
+        })(),
+      "voice.status": () => sync(() => this.voice)(),
+      "voice.install": () =>
+        sync(() => {
+          this.voice = { state: "ready", model: this.voice.model }
+          return this.voice
+        })(),
+      "voice.preview": () => sync(() => ({ pcmBase64: "", sampleRate: 24_000 }))(),
+      "voice.remove": () =>
+        sync(() => {
+          this.voice = { state: "absent", model: this.voice.model, downloadBytes: VOICE_DOWNLOAD_BYTES }
+          return this.voice
         })(),
       "stt.open": () =>
         sync(() => {

@@ -235,6 +235,7 @@ describe("transcript", () => {
       { type: "auto-decided", decision: "allowed", summary: "git status", toolName: "Bash", ruleId: "rul_1" },
       { type: "request-elsewhere", botId: "bot_1", requestId: "req_1", conversationId: "cnv_1" },
       { type: "session-changed", botId: "bot_1", action: "new-session" },
+      { type: "voice-call", botId: "bot_1", durationMs: 31_000, lines: [{ who: "you", text: "Yo, what's up?" }, { who: "bot", text: "Not much." }] },
     ]
     for (const event of events) {
       const entry = Schema.decodeUnknownSync(KnownTranscriptEntry)({ ...base, kind: "event", event })

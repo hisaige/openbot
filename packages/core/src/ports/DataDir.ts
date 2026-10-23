@@ -34,6 +34,8 @@ export interface DataDirShape {
   /** `<root>/slack.json` (0600): the owner's Slack tokens (D3.4). */
   readonly slack: string
   readonly stt: string
+  /** Voice calls (experiment): llama.cpp, the voice model, Kokoro. */
+  readonly voice: string
   /** `<root>/hark.json` (0600): the owner's Hark webhook (D3.5). */
   readonly hark: string
 }
@@ -63,6 +65,7 @@ export const makeDataDir = (root: string): DataDirShape => {
     brainIdentity: joinPath(base, "brain-identity.json"),
     slack: joinPath(base, "slack.json"),
     stt: joinPath(base, "stt"),
+    voice: joinPath(base, "voice"),
     hark: joinPath(base, "hark.json"),
   }
 }

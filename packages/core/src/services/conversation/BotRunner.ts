@@ -269,6 +269,10 @@ interface TurnFailure {
 
 const fail = (code: string, message: string, retryable = false): TurnFailure => ({ code, message, retryable })
 
+/** Every delivery in it came from a voice call: the turn stays out of the chat. */
+const voiceTurn = (deliveries: ReadonlyArray<Delivery>): true | undefined =>
+  deliveries.length > 0 && deliveries.every((d) => d.voice === true) ? true : undefined
+
 const triggerOf = (delivery: Delivery): Turn["trigger"] => {
   switch (delivery.kind) {
     case "user-message":
@@ -811,6 +815,7 @@ export const makeRunner = (deps: RunnerDeps, botId: BotId): Effect.Effect<Runner
           trigger: triggerOf(first),
           inputEntryId,
           startedAt: now,
+          voice: voiceTurn(active.deliveries),
         })
         yield* writeTurn(active.turn)
         yield* setActivity({ botId, conversationId, state: "thinking", since: now })
@@ -1045,6 +1050,7 @@ export const makeRunner = (deps: RunnerDeps, botId: BotId): Effect.Effect<Runner
           status: "running",
           trigger: triggerOf(active.deliveries[0]!),
           startedAt: now,
+          ...(voiceTurn(active.deliveries) ? { voice: true } : {}),
         }
         const turn = compact<Turn>({
           ...base,
@@ -1102,7 +1108,8 @@ export const makeRunner = (deps: RunnerDeps, botId: BotId): Effect.Effect<Runner
           // Only with something to read: a turn that ended quietly (NO_REPLY, a reaction, only steps)
           // is not news.
           const said = finalized.lastBotMessage?.trim()
-          if (terminal._tag === "completed" && said && (turn.trigger === "user" || turn.trigger === "routine" || reported)) {
+          // a voice call's work is told on the call: no notification
+          if (terminal._tag === "completed" && said && turn.voice !== true && (turn.trigger === "user" || turn.trigger === "routine" || reported)) {
             yield* deps.notifier.notify({
               kind: "finished",
               botId,
@@ -1172,6 +1179,7 @@ export const makeRunner = (deps: RunnerDeps, botId: BotId): Effect.Effect<Runner
             botId,
             status: "queued",
             trigger: triggerOf(delivery),
+            ...(delivery.voice === true ? { voice: true } : {}),
             startedAt: yield* Clock.currentTimeMillis,
           })
         }
@@ -1415,6 +1423,7 @@ export const makeRunner = (deps: RunnerDeps, botId: BotId): Effect.Effect<Runner
             botId,
             status: "queued",
             trigger: triggerOf(delivery),
+            ...(delivery.voice === true ? { voice: true } : {}),
             ...(delivery.kind === "user-message" && delivery.sourceEntryId !== undefined ? { inputEntryId: delivery.sourceEntryId } : {}),
             startedAt: yield* Clock.currentTimeMillis,
           })
@@ -1444,6 +1453,7 @@ export const makeRunner = (deps: RunnerDeps, botId: BotId): Effect.Effect<Runner
                 conversationId: work.delivery.conversationId,
                 botId,
                 trigger: triggerOf(work.delivery),
+                ...(work.delivery.voice === true ? { voice: true } : {}),
                 startedAt: now,
               }),
             status: "interrupted" as const,

@@ -12,6 +12,7 @@
  *   that signs its in-app web view in, `GET /api/auth/login?code=&next=`).
  * - `GET /api/attachments/:id` (cookie + Origin).
  * - `/ws/computer/:botId`, `/ws/terminal/:botId` (brain-nodes viewers, same auth as `/rpc`).
+ * - `/ws/voice/:botId`: a voice call with a Bot (experiment; same auth as `/rpc`).
  * - `/node`, `POST /node/pair`, `/node/stream/:id` (brain-nodes; node signatures, codes, one-time tokens).
  *
  * Internal: `/mcp/:botId` (gateway, bearer only) and `/relay/:nodeId/:kind` (brain-nodes).
@@ -29,6 +30,7 @@ import { RpcSerialization, RpcServer } from "effect/rpc"
 import { WebAuth, searchParamsOf, sessionTokenOf } from "./auth.ts"
 import { ServerConfig } from "./config.ts"
 import { PublicListener } from "./listeners.ts"
+import { VoiceCalls } from "./voice/service.ts"
 import { loginPage, makeWebApp, PAGE_HEADERS, STATIC_PAGE_CSP, unavailablePage } from "./web.ts"
 
 /** `HttpRouter.use`, spelled out (a layer that adds routes to the ambient router). */
@@ -456,8 +458,25 @@ export const ViewerRoutesLive = ViewerRoutes((input) =>
 
 // ============================================================================ composition
 
+/** `/ws/voice/:botId`: a voice call (experiment), with the same credentials as `/rpc`. */
+const VoiceRoute = routes(Effect.fnUntraced(function*(router) {
+  const voice = yield* VoiceCalls
+  const auth = yield* WebAuth
+  yield* router.add(
+    "GET",
+    "/ws/voice/:botId",
+    Effect.gen(function*() {
+      const request = yield* HttpServerRequest.HttpServerRequest
+      const result = yield* auth.authenticate(request, { allowTicket: true })
+      if (!result.ok) return refusal(result.status, result.reason)
+      const params = yield* HttpRouter.params
+      return yield* voice.call(params["botId"] ?? "")
+    }),
+  )
+}))
+
 /** Every public route. */
-export const PublicRoutes = Layer.mergeAll(RpcRoute, AuthRoutes, AttachmentRoutes, WebRoutes, ViewerRoutesLive, NodePublicRoutes, DesktopRoutes)
+export const PublicRoutes = Layer.mergeAll(RpcRoute, AuthRoutes, AttachmentRoutes, WebRoutes, ViewerRoutesLive, VoiceRoute, NodePublicRoutes, DesktopRoutes)
 
 /** `/mcp/:botId` → `McpGateway.handle` (the gateway checks the bearer; cookies are ignored). */
 export const McpRoute = routes(Effect.fnUntraced(function*(router) {

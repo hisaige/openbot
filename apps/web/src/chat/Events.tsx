@@ -4,6 +4,7 @@ import { Archive, Ban, BookMarked, Brain, CircleAlert, Clock, Info, ShieldCheck,
 import type { ReactNode } from "react"
 import type { Bot, ConversationId } from "@openbot/contracts"
 import { Avatar, AvatarStack, EventChip, EventLine, Icon, cn } from "@openbot/ui"
+import { VoiceChatLine } from "../voice/VoiceChatLine.tsx"
 import type { ExchangeTarget } from "./exchange.ts"
 import type { EventEntry, MessageEntry, NoticeEntry, UnknownEntry } from "./grouping.ts"
 
@@ -213,6 +214,8 @@ export function EventRow({ entry, ctx }: { readonly entry: EventEntry; readonly 
           {ctx.botById(ev.botId) && <span className="text-fg-tertiary">&nbsp;· {ctx.botById(ev.botId)!.name}</span>}
         </EventLine>
       )
+    case "voice-call":
+      return <VoiceChatLine durationMs={ev.durationMs} lines={ev.lines} />
     default:
       return <EventLine className="text-fg-tertiary">Something happened here that this version of OpenBot can't show.</EventLine>
   }

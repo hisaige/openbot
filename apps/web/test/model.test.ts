@@ -187,6 +187,19 @@ describe("layoutTranscript", () => {
     expect(layoutTranscript({ entries, turns: [], showSteps: true, showCompactions: true }).map((r) => r.type)).toEqual(["timestamp", "group", "event", "group"])
   })
 
+  test("work handed over on a voice call stays out of the chat", () => {
+    const t0 = 3_600_000_000
+    const entries: Array<KnownTranscriptEntry> = [
+      msg(t0, user, "hi"),
+      { ...msg(t0 + 1, bot(), "Two meetings tomorrow."), turnId: "trn_voice" as TurnId },
+      { ...msg(t0 + 2, bot(), "hello"), turnId: "trn_1" as TurnId },
+    ]
+    const turns = [{ ...turn("trn_voice", "completed"), voice: true }, turn("trn_1", "completed")]
+    const rows = layoutTranscript({ entries, turns, showSteps: true })
+    expect(JSON.stringify(rows)).not.toContain("Two meetings tomorrow.")
+    expect(JSON.stringify(rows)).toContain("hello")
+  })
+
   test("a turn with only auto-decisions still gets a steps disclosure", () => {
     const t0 = 3_600_000_000
     const entries: Array<KnownTranscriptEntry> = [

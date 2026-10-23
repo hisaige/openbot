@@ -206,6 +206,8 @@ const describeEvent = (entry: EventEntry, ctx: RowContext): string => {
       return `${name(ev.botId)} needs your approval in your direct chat`
     case "session-changed":
       return ev.action === "compacted" ? "Compacted context" : "Started a new session"
+    case "voice-call":
+      return `Voice chat · ${Math.floor(ev.durationMs / 60_000)}:${String(Math.floor(ev.durationMs / 1000) % 60).padStart(2, "0")}`
     default:
       return "Something happened here that this version of the app can't show."
   }

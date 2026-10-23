@@ -20,6 +20,7 @@ import { isPhoneNow, useLayoutMode, useVisualViewport } from "./layout.ts"
 import { useBackDismiss } from "./nav.ts"
 import { useSystemNotifications } from "./notifications.ts"
 
+import { CallBar } from "../voice/CallBar.tsx"
 const ConnectAppsDialog = lazy(() => import("../connections/ConnectAppsDialog.tsx").then((m) => ({ default: m.ConnectAppsDialog })))
 import {
   isNewChatHash,
@@ -277,7 +278,12 @@ export function App(): ReactNode {
         sidebar={({ compact: c, toggleCompact }) => (
           <Sidebar compact={c} onToggleCompact={toggleCompact} onSearch={() => dialogs.show({ kind: "search" })} onNewChat={() => select(null)} />
         )}
-        chat={conversationId ? <ChatView key={conversationId} conversationId={conversationId} /> : <NewChatView onClose={newChatClose} />}
+        chat={
+          <>
+            {conversationId ? <ChatView key={conversationId} conversationId={conversationId} /> : <NewChatView onClose={newChatClose} />}
+            <CallBar />
+          </>
+        }
         details={
           details.open && conversationId ? (
             <Suspense fallback={<PaneLoading />}>

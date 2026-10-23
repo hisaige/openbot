@@ -17,7 +17,7 @@ import {
   type ConversationId,
   type Turn,
 } from "@openbot/contracts"
-import { commands, conversationAtom, discardOutboxItemAtom, loadOlderAtom, outboxAtom, retrySendAtom, retryTurnAtom, sendMessageAtom, interruptTurnAtom } from "@openbot/client"
+import { commands, conversationAtom, discardOutboxItemAtom, loadOlderAtom, outboxAtom, retrySendAtom, retryTurnAtom, sendMessageAtom, interruptTurnAtom, voiceStatusAtom } from "@openbot/client"
 import { ActivityRow, Avatar, AvatarStack, HeaderPill, Icon, IconButton, NewDivider, PillButton, Spinner, Timestamp, botTintStyle, cn, useToast } from "@openbot/ui"
 import { useRoster, valueOr } from "../app/data.ts"
 import { formatTimestamp } from "../app/format.ts"
@@ -36,6 +36,9 @@ import { failedTurnOf, layoutTranscript, messageIndex, positionIn, requestForCar
 import { AddresseeChip, MessageBubble, PendingBubble } from "./Message.tsx"
 import { MessageSheet } from "./MessageSheet.tsx"
 import { StepsDisclosure } from "./Steps.tsx"
+import { useQuery } from "../details/kit.tsx"
+import { useVoiceCall } from "../voice/CallBar.tsx"
+import { startCall } from "../voice/voiceCall.ts"
 
 const ACTIVE = new Set<Turn["status"]>(["queued", "running", "waiting"])
 
@@ -85,6 +88,8 @@ export function ChatView({ conversationId }: { readonly conversationId: Conversa
     : ((summary?.botIds ?? []) as ReadonlyArray<BotId>)
   const members = botIds.map((id) => roster.botById(id)).filter((b): b is Bot => b !== undefined)
   const isGroup = (conversation?.kind ?? summary?.kind) === "group"
+  const voiceCalls = useQuery(voiceStatusAtom)
+  const call = useVoiceCall()
   const primary = members[0]
   const title = isGroup ? (conversation?.title || summary?.title || members.map((m) => m.name).join(", ")) : (primary?.name ?? summary?.title ?? "")
   const tint = settings.accent === "bot" && !isGroup && primary ? botTintStyle(primary.avatar.color) : {}
@@ -147,13 +152,15 @@ export function ChatView({ conversationId }: { readonly conversationId: Conversa
   )
 
   // ------------------------------------------------------------------------------- activity
-  const activeTurns = turns.filter((t) => ACTIVE.has(t.status)).sort((a, b) => a.startedAt - b.startedAt)
+  // work handed over on a voice call is told on the call: no status line, no Stop
+  const activeTurns = turns.filter((t) => ACTIVE.has(t.status) && t.voice !== true).sort((a, b) => a.startedAt - b.startedAt)
+  const onCallOnly = new Set(turns.filter((t) => ACTIVE.has(t.status) && t.voice === true && !activeTurns.some((a) => a.botId === t.botId)).map((t) => t.botId))
   // ONE status line per bot, in the activity row's look (busy.ts): its turn here, else "Busy in …"
   // (one mind per bot, D5.0) or "Handling…" (background work started here, D5.7).
   const statuses = chatStatuses({
     conversationId,
     botIds,
-    activities: roster.state.activities,
+    activities: onCallOnly.size === 0 ? roster.state.activities : new Map([...roster.state.activities].filter(([botId]) => !onCallOnly.has(botId))),
     turns: activeTurns,
     conversations: roster.state.conversations,
     tasks: roster.state.tasks,
@@ -210,6 +217,11 @@ export function ChatView({ conversationId }: { readonly conversationId: Conversa
     prevHeight.current = null
     if (stick.current) el.scrollTop = el.scrollHeight
   }, [rows, statuses.length, showTray])
+  // too little to scroll (a short page) means no scroll to load older on: load it until there is
+  useEffect(() => {
+    const el = scrollRef.current
+    if (el !== null && el.scrollHeight <= el.clientHeight) onScroll()
+  }, [rows, onScroll])
   // (ChatView is keyed by conversation id in the shell, so per-conversation state starts fresh.)
   const scrollToBottom = () => {
     const el = scrollRef.current
@@ -480,6 +492,7 @@ export function ChatView({ conversationId }: { readonly conversationId: Conversa
           onCancelReply={() => setReplyTo(undefined)}
           context={contextUsage}
           autoFocus
+          onCall={!isGroup && primary !== undefined && voiceCalls.value?.state === "ready" && call.botId !== primary.id ? () => void startCall(primary.id) : undefined}
         />
       </div>
       {sheetEntry && (

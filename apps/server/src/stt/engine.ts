@@ -37,7 +37,7 @@ const PCM16_SCALE = 0x8000
 
 const lastLines = (text: string): string => text.trim().split("\n").slice(-ERROR_TAIL_LINES).join(" ")
 
-const errorReason = (stderr: string): string => {
+export const errorReason = (stderr: string): string => {
   const lines = stderr.trim().split("\n").map((line) => line.trim())
   return lines.findLast((line) => /^error\b/i.test(line)) ?? lastLines(stderr)
 }
@@ -56,7 +56,7 @@ export const markInstalled = (layout: SttLayout, runtime: SttArchive, model: Stt
   return writeFile(layout.marker, JSON.stringify(marker))
 }
 
-const downloadVerified = async (archive: SttArchive, file: string, onReceived: (bytes: number) => void, signal: AbortSignal) => {
+export const downloadVerified = async (archive: SttArchive, file: string, onReceived: (bytes: number) => void, signal: AbortSignal) => {
   const response = await fetch(archive.url, { signal })
   if (!response.ok || response.body === null) throw new Error(`Downloading ${archive.url} failed (HTTP ${response.status}).`)
   const hash = createHash("sha256")
@@ -77,12 +77,12 @@ const downloadVerified = async (archive: SttArchive, file: string, onReceived: (
 }
 
 const untar = async (archiveFile: string, into: string) => {
-  const tar = Bun.spawn(["tar", "-xjf", archiveFile, "-C", into], { stdout: "ignore", stderr: "pipe", timeout: UNPACK_TIMEOUT_MS })
+  const tar = Bun.spawn(["tar", archiveFile.endsWith(".gz") ? "-xzf" : "-xjf", archiveFile, "-C", into], { stdout: "ignore", stderr: "pipe", timeout: UNPACK_TIMEOUT_MS })
   const [exitCode, stderr] = await Promise.all([tar.exited, new Response(tar.stderr).text()])
   if (exitCode !== 0) throw new Error(`Unpacking ${path.basename(archiveFile)} failed: ${lastLines(stderr)}`)
 }
 
-const unpackSingleFolder = async (archiveFile: string, destination: string, staging: string) => {
+export const unpackSingleFolder = async (archiveFile: string, destination: string, staging: string) => {
   await rm(staging, { recursive: true, force: true })
   await mkdir(staging, { recursive: true })
   await untar(archiveFile, staging)
@@ -93,7 +93,7 @@ const unpackSingleFolder = async (archiveFile: string, destination: string, stag
   await rm(staging, { recursive: true, force: true })
 }
 
-const archiveFileName = (archive: SttArchive): string => path.basename(new URL(archive.url).pathname)
+export const archiveFileName = (archive: SttArchive): string => path.basename(new URL(archive.url).pathname)
 
 export const downloadStt = async (
   layout: SttLayout,
@@ -161,9 +161,9 @@ interface RecognizerOptions {
   readonly startupTimeoutMs: number
 }
 
-const sharedLibraryName = (): string => (process.platform === "darwin" ? "libsherpa-onnx-c-api.dylib" : "libsherpa-onnx-c-api.so")
+export const sharedLibraryName = (): string => (process.platform === "darwin" ? "libsherpa-onnx-c-api.dylib" : "libsherpa-onnx-c-api.so")
 
-const killGroup = (pid: number, signal: NodeJS.Signals) => {
+export const killGroup = (pid: number, signal: NodeJS.Signals) => {
   try {
     process.kill(-pid, signal)
   } catch {
@@ -182,7 +182,7 @@ const recognizerLaunch = (options: RecognizerOptions): RecognizerLaunch => ({
   sampleRate: options.sampleRate,
 })
 
-const libraryPathWith = (libraryDir: string): string =>
+export const libraryPathWith = (libraryDir: string): string =>
   [libraryDir, process.env["LD_LIBRARY_PATH"]].filter((entry) => entry !== undefined && entry !== "").join(":")
 
 export const startRecognizer = (options: RecognizerOptions): Promise<Recognizer> =>

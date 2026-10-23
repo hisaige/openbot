@@ -218,5 +218,7 @@ export const describeEvent = (event: KnownConversationEvent): string => {
       return "Waiting for you in a direct chat"
     case "session-changed":
       return event.action === "new-session" ? "Started a new session" : "Compacted the session"
+    case "voice-call":
+      return "Voice chat"
   }
 }

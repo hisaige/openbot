@@ -22,7 +22,8 @@
  *   the task's session. Auto-decisions go to the task's steps. A task cannot ask the owner.
  * - When a task ends, a `task-result` delivery (`results`, drained by the Orchestrator) brings its
  *   result — or why it failed / that the owner stopped it — to the bot's MAIN session in the origin
- *   conversation (its DM when it left that conversation), so the bot reports in its own words.
+ *   conversation (its DM when it left that conversation), so the bot reports in its own words. Work
+ *   started on a voice call reports on the call while it lasts (a `voice` delivery: `CallPresence`).
  *   A task the bot stopped itself, or one stopped because its bot / group was deleted, is not reported.
  * - Restart: boot recovery fails queued/running tasks ("interrupted by a restart"); `recover`
  *   publishes them and tells each bot once the drivers are registered.
@@ -65,11 +66,12 @@ import { IdGen } from "../../ports/IdGen.ts"
 import { McpBindingIssuer, type McpClaims } from "../../ports/Mcp.ts"
 import type { BootRecoveryReport } from "../../ports/Persistence.ts"
 import { PlacementService } from "../../ports/Placement.ts"
-import { BotRepo, ConversationRepo, EntryRepo, TaskRepo } from "../../ports/repos.ts"
+import { BotRepo, ConversationRepo, EntryRepo, TaskRepo, TurnRepo } from "../../ports/repos.ts"
 import {
   ApprovalService,
   type ApprovalWorkspace,
   BackgroundTasks,
+  CallPresence,
   type DeliveryInput,
   InstructionRenderer,
   LiveHub,
@@ -416,6 +418,10 @@ const makeBackgroundTasks = (options: BackgroundTasksOptions) =>
     const conversations = yield* ConversationRepo
     const entries = yield* EntryRepo
     const repo = yield* TaskRepo
+    // voice calls (experiment): work started on a call reports back on it
+    const presence = Option.getOrUndefined(yield* Effect.serviceOption(CallPresence))
+    const turnRepo = Option.getOrUndefined(yield* Effect.serviceOption(TurnRepo))
+    const fromCall = new Set<TaskId>()
 
     const throttleMs = Duration.toMillis(Duration.fromInputUnsafe(options.progressThrottle))
     const results = yield* Queue.unbounded<DeliveryInput>()
@@ -497,6 +503,7 @@ const makeBackgroundTasks = (options: BackgroundTasksOptions) =>
       Effect.gen(function*() {
         const conversationId = yield* reportTo(task)
         if (conversationId === undefined) return
+        const onCall = fromCall.delete(task.id) && presence?.onCall(task.botId) === true
         yield* Queue.offer(results, {
           conversationId,
           botId: task.botId,
@@ -504,6 +511,7 @@ const makeBackgroundTasks = (options: BackgroundTasksOptions) =>
           text: taskResultText(task, partial),
           urgency: "urgent",
           taskId: task.id,
+          ...(onCall ? { voice: true } : {}),
         })
       })
 
@@ -827,6 +835,11 @@ const makeBackgroundTasks = (options: BackgroundTasksOptions) =>
       if (key !== undefined) {
         startedBy.set(key, task.id)
         if (startedBy.size > 1_000) startedBy.delete(startedBy.keys().next().value!)
+      }
+      // started from a voice call's turn: it reports back on the call (if it is still on)
+      if (ctx.turnId !== undefined && turnRepo !== undefined) {
+        const turn = yield* turnRepo.get(ctx.turnId).pipe(Effect.orElseSucceed(() => Option.none()))
+        if (Option.isSome(turn) && turn.value.voice === true) fromCall.add(task.id)
       }
       lives.set(task.id, {
         task,

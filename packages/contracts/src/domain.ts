@@ -111,6 +111,8 @@ export const Bot = Schema.Struct({
    * a Bot asks with an approval card (`enable_skill`), except for skills it saves itself.
    */
   skills: Schema.Array(SkillName).pipe(Schema.withDecodingDefaultKey(Effect.succeed([]))),
+  /** Its voice on calls (experiment): a Kokoro voice id; absent: one picked for it. */
+  voice: Schema.optionalKey(Schema.String),
   createdAt: Millis,
   updatedAt: Millis,
 })
