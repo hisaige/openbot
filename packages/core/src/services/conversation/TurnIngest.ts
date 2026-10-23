@@ -30,7 +30,7 @@ import type {
   TurnId,
   Usage,
 } from "@openbot/contracts"
-import { Clock, Deferred, Effect, Option } from "effect"
+import { Clock, Deferred, Duration, Effect, Option, Scope, Semaphore } from "effect"
 import { BotRepo, EntryRepo } from "../../ports/repos.ts"
 import type { ConversationService, EntryDraft, LiveHub, UsageService } from "../../ports/services.ts"
 import type { ConversationStore } from "./internal/ConversationStore.ts"
@@ -67,6 +67,10 @@ const mayBecomeNoReply = (text: string): boolean => {
 /** Minimum time between two context-ring publishes for one session (the last value is flushed at turn end). */
 export const CONTEXT_USAGE_THROTTLE_MS = 2_000
 
+/** G2 trailing throttle: minimum gap between two intermediate writes of one entry. */
+export const ENTRY_UPSERT_THROTTLE_MS = 500
+/** G2 cap on intermediate writes per entry per stream (same value and semantics as G1). */
+export const MAX_ENTRY_UPSERTS_PER_STREAM = 16
 export const addUsage = (a: Usage | undefined, b: Usage): Usage => {
   if (a === undefined) return b
   const sum = (x: number | undefined, y: number | undefined) => (x === undefined && y === undefined ? undefined : (x ?? 0) + (y ?? 0))
@@ -168,6 +172,10 @@ export interface SessionIngestDeps {
    * Runs on the event fiber: later events of the session wait for it.
    */
   readonly onHarnessTurn: (nativeTurnId: TurnId, ingest: SessionIngest) => Effect.Effect<HarnessTurnRoute | undefined>
+  /** G2 throttle override (defaults 500 ms / 16); `BotRunner` never sets it — tests do. */
+  readonly upsertThrottle?: {
+    readonly windowMs?: number | undefined; readonly maxIntermediateWrites?: number | undefined
+  } | undefined
 }
 
 export interface SessionIngest {
@@ -232,8 +240,20 @@ export const updateSessionRow = (
     }))
   })
 
-export const makeSessionIngest = (deps: SessionIngestDeps): Effect.Effect<SessionIngest> =>
-  Effect.sync(() => {
+/** Per-key trailing throttle (G2 §2.2): one small record per entry, same order as `keys`. */
+type KeyThrottle = {
+  lastWriteAt: number // last write (`-Infinity` = a new key writes at once)
+  writes: number // intermediate writes of the current stream (only these are capped)
+  seq: number // generation of `pending`: a timer only flushes its own generation
+  pending: { readonly turnId: TurnId; readonly item: HarnessItem } | undefined // newest unwritten snapshot
+}
+export const makeSessionIngest = (deps: SessionIngestDeps): Effect.Effect<SessionIngest, never, Scope.Scope> =>
+  Effect.gen(function*() {
+    const scope = yield* Effect.scope
+    /** One writer at a time, so an older snapshot never lands after a terminal item (INV-5). */
+    const writeLock = yield* Semaphore.make(1)
+    const windowMs = deps.upsertThrottle?.windowMs ?? ENTRY_UPSERT_THROTTLE_MS
+    const maxWrites = deps.upsertThrottle?.maxIntermediateWrites ?? MAX_ENTRY_UPSERTS_PER_STREAM
     const keys = new Map<string, EntryId>()
     const terminals = new Map<TurnId, Deferred.Deferred<TurnTerminal>>()
     const turnConversations = new Map<TurnId, ConversationId>()
@@ -249,11 +269,13 @@ export const makeSessionIngest = (deps: SessionIngestDeps): Effect.Effect<Sessio
     /** Harness-initiated turn (adapter id) → where its events go. */
     const routes = new Map<TurnId, HarnessTurnRoute>()
     const routeOf = (turnId: TurnId): TurnId => routes.get(turnId)?.turnId ?? turnId
+    const throttle = new Map<string, KeyThrottle>()
+    /** Set by the session scope's finalizer: from then on nothing reaches the store (INV-9). */
+    let closed = false
     /** Drops the oldest keys beyond `TURN_CONVERSATIONS_KEPT`. */
     const keep = <K>(collection: { readonly size: number; keys(): Iterator<K>; delete(key: K): boolean }) => {
       while (collection.size > TURN_CONVERSATIONS_KEPT) collection.delete(collection.keys().next().value as K)
     }
-
     const publishContext = (value: { readonly usedTokens: number; readonly windowTokens: number }) =>
       updateSessionRow(deps.store, deps.homeConversationId, deps.botId, (row, now) => {
         if (
@@ -263,30 +285,26 @@ export const makeSessionIngest = (deps: SessionIngestDeps): Effect.Effect<Sessio
         return { botId: deps.botId, active: true, contextUsage: { ...value }, updatedAt: now }
       })
 
-    const complete = (nativeTurnId: TurnId, terminal: TurnTerminal) =>
-      Effect.suspend(() => {
-        const route = routes.get(nativeTurnId)
-        // A harness-initiated turn folded into a running turn never ends it.
-        if (route?.joined === true) return Effect.void
-        const turnId = route?.turnId ?? nativeTurnId
-        ended.add(turnId)
-        keep(ended)
-        const deferred = terminals.get(turnId)
-        return deferred === undefined ? Effect.void : Effect.asVoid(Deferred.succeed(deferred, terminal))
-      })
-
-    const upsertItem = (turnId: TurnId, key: string, item: HarnessItem) =>
+    const throttleOf = (key: string): KeyThrottle => {
+      let st = throttle.get(key)
+      if (st === undefined) throttle.set(key, (st = { lastWriteAt: Number.NEGATIVE_INFINITY, writes: 0, seq: 0, pending: undefined }))
+      return st
+    }
+    /** Drops a key's pending snapshot and invalidates the timer armed for it. */
+    const invalidate = (st: KeyThrottle): void => {
+      st.pending = undefined
+      st.seq += 1
+    }
+    /** Drops every pending snapshot (session close / scope close): their timers become no-ops. */
+    const dropAll = (): void => {
+      for (const st of throttle.values()) invalidate(st)
+    }
+    /** The one write path (A1): key cache, native-id adoption, `updateEntry` → `appendEntry` fallback. */
+    const writeItemBody = (turnId: TurnId, key: string, item: HarnessItem): Effect.Effect<void> =>
       Effect.gen(function*() {
         const now = yield* Clock.currentTimeMillis
         const conversationId = conversationOf(turnId)
         let id = keys.get(key)
-        // Silent replies (`NO_REPLY`) are never posted; a streaming prefix of it is held back.
-        if (item._tag === "Message" && (item.streaming ? mayBecomeNoReply(item.text) : isNoReply(item.text))) {
-          if (id === undefined || item.streaming) return
-          keys.delete(key)
-          yield* Effect.ignore(deps.conversationService.removeEntry(id))
-          return
-        }
         if (id === undefined) {
           const found = yield* orDie(deps.entries.findByNativeId(conversationId, key))
           // Native keys are only unique per harness session: never adopt another bot's entry.
@@ -328,7 +346,98 @@ export const makeSessionIngest = (deps: SessionIngestDeps): Effect.Effect<Sessio
         const entry = yield* Effect.result(deps.conversationService.appendEntry(draft))
         if (entry._tag === "Success") keys.set(key, entry.success.id)
       })
-
+    /** Serialized write; `current` is checked under the lock, so a superseded snapshot never lands (INV-5). */
+    const writeItem = (turnId: TurnId, key: string, item: HarnessItem, current?: () => boolean): Effect.Effect<void> =>
+      writeLock.withPermits(1)(
+        Effect.suspend(() => (closed || current?.() === false ? Effect.void : writeItemBody(turnId, key, item))),
+      )
+    /** Writes the pending snapshot of `key` when it still belongs to generation `seq`. */
+    const flushPending = (key: string, seq: number, counted: boolean): Effect.Effect<boolean> =>
+      Effect.suspend(() => {
+        const st = throttle.get(key)
+        if (st?.pending === undefined || st.seq !== seq) return Effect.succeed(false)
+        const { turnId, item } = st.pending
+        st.pending = undefined
+        return writeItem(turnId, key, item, () => st.seq === seq).pipe(
+          Effect.andThen(Clock.currentTimeMillis),
+          Effect.map((now) => {
+            st.lastWriteAt = now
+            if (counted) st.writes += 1
+            return true
+          }),
+        )
+      })
+    /** Arms the trailing flush; a newer generation makes this timer a no-op (spin ≤ one window). */
+    const armFlush = (key: string, st: KeyThrottle, delayMs: number): Effect.Effect<void> => {
+      st.seq += 1
+      const flush = Effect.sleep(Duration.millis(Math.max(0, delayMs))).pipe(
+        Effect.andThen(flushPending(key, st.seq, true)),
+        Effect.catchCause((cause) => Effect.logError(`TurnIngest: flush ${key} failed`, cause)),
+      )
+      return Effect.asVoid(Effect.forkIn(flush, scope, { startImmediately: true }))
+    }
+    /** Writes every pending snapshot of a turn before its `Deferred` completes (§3.1, INV-6). */
+    const flushTurn = (turnId: TurnId): Effect.Effect<void> =>
+      Effect.forEach([...throttle.entries()], ([key, st]) =>
+        st.pending?.turnId === turnId ? flushPending(key, st.seq, false) : Effect.succeed(false), { discard: true })
+    const complete = (nativeTurnId: TurnId, terminal: TurnTerminal): Effect.Effect<void> =>
+      Effect.gen(function*() {
+        const route = routes.get(nativeTurnId)
+        // A harness-initiated turn folded into a running turn never ends it.
+        if (route?.joined === true) return
+        const turnId = route?.turnId ?? nativeTurnId
+        // §3.1: the snapshots land before the runner's Deferred, so finalize reads the terminal text.
+        // A flush failure must still complete the Deferred (N4), or the runner waits for session close.
+        yield* flushTurn(turnId).pipe(Effect.catchCause((cause) => Effect.logError("TurnIngest: flush turn failed", cause)))
+        ended.add(turnId)
+        keep(ended)
+        const deferred = terminals.get(turnId)
+        if (deferred !== undefined) yield* Deferred.succeed(deferred, terminal)
+      })
+    /** G2 §2.2: NO_REPLY and terminal items bypass the window; the rest lands on the trailing timer. */
+    const upsertItem = (turnId: TurnId, key: string, item: HarnessItem): Effect.Effect<void> =>
+      Effect.gen(function*() {
+        // A streaming NO_REPLY prefix is held back; a terminal one drops the snapshot and the entry.
+        if (item._tag === "Message" && item.streaming && mayBecomeNoReply(item.text)) return
+        if (item._tag === "Message" && !item.streaming && isNoReply(item.text)) {
+          invalidate(throttleOf(key))
+          const silent = keys.get(key)
+          if (silent === undefined) return
+          keys.delete(key)
+          yield* Effect.ignore(deps.conversationService.removeEntry(silent))
+          return
+        }
+        const now = yield* Clock.currentTimeMillis
+        const st = throttleOf(key)
+        const terminal = item._tag === "ToolCall"
+          ? TERMINAL_TOOL.has(item.status)
+          : (item._tag === "Message" || item._tag === "Reasoning") && !item.streaming
+        // Rule 3: a terminal item is written at once; the older snapshot must never follow it.
+        if (terminal) {
+          invalidate(st)
+          st.writes = 0
+          st.lastWriteAt = now
+          yield* writeItem(turnId, key, item)
+          return
+        }
+        // Rule 4: only the newest snapshot is kept; past the cap the timer becomes an idle flush.
+        if (st.pending !== undefined) {
+          st.pending = { turnId, item }
+          if (st.writes >= maxWrites) yield* armFlush(key, st, windowMs)
+          return
+        }
+        const capped = st.writes >= maxWrites
+        // Rule 5: leading edge — a new key, or a window already open.
+        if (!capped && now - st.lastWriteAt >= windowMs) {
+          st.lastWriteAt = now
+          st.writes += 1
+          yield* writeItem(turnId, key, item)
+          return
+        }
+        // Rules 6/7: trailing edge (after idle once capped).
+        st.pending = { turnId, item }
+        yield* armFlush(key, st, capped ? windowMs : st.lastWriteAt + windowMs - now)
+      })
     const handle = (event: HarnessEvent): Effect.Effect<void> => {
       switch (event._tag) {
         case "SessionBound":
@@ -402,7 +511,8 @@ export const makeSessionIngest = (deps: SessionIngestDeps): Effect.Effect<Sessio
         case "TurnInterrupted":
           return complete(event.turnId, { _tag: "interrupted" })
         case "SessionClosed":
-          return deps.onSessionClosed(event.reason)
+          // Rule 9: no pending snapshot survives the closed session; its timers become no-ops.
+          return Effect.andThen(Effect.sync(dropAll), deps.onSessionClosed(event.reason))
       }
     }
 
@@ -432,8 +542,12 @@ export const makeSessionIngest = (deps: SessionIngestDeps): Effect.Effect<Sessio
       endTurn: (turnId) => {
         terminals.delete(turnId)
         usage.delete(turnId)
+        // A finished turn takes its unwritten snapshots with it (the sync `endTurn` cannot await a write).
+        for (const st of throttle.values()) if (st.pending?.turnId === turnId) invalidate(st)
       },
     }
+    // Rule 10: the session scope owns the timers; once it closes nothing may write (INV-9).
+    yield* Effect.addFinalizer(() => Effect.sync(() => { closed = true; dropAll() }))
     return self
   })
 
